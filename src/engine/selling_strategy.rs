@@ -813,6 +813,7 @@ impl SellingEngine {
         // Update highest price if applicable
         if price > entry.highest_price {
             entry.highest_price = price;
+            self.logger.log(format!("New highest price for {}: {:.8}", token_mint, price).green().to_string());
         }
         
         // Update lowest price if applicable (initialize or update if lower)
@@ -826,6 +827,9 @@ impl SellingEngine {
             entry.price_history.pop_front();
         }
         
+        // Update last_update timestamp
+        entry.last_update = Instant::now();
+        
         // Log current metrics
         let pnl = if entry.entry_price > 0.0 {
             ((price - entry.entry_price) / entry.entry_price) * 100.0
@@ -833,13 +837,19 @@ impl SellingEngine {
             0.0
         };
         
-        logger.log(format!(
-            "Token metrics for {}: Price: {}, Entry: {}, Highest: {}, Lowest: {}, PNL: {:.2}%, Balance: {}, Liquidity: {:.2} SOL",
-            token_mint, price, entry.entry_price, entry.highest_price, entry.lowest_price, pnl, actual_token_balance, current_liquidity
+        let retracement = if entry.highest_price > 0.0 {
+            (entry.highest_price - price) / entry.highest_price * 100.0
+        } else {
+            0.0
+        };
+        
+        self.logger.log(format!(
+            "Token metrics for {}: Price: {:.8}, Entry: {:.8}, High: {:.8}, Low: {:.8}, PNL: {:.2}%, Retracement: {:.2}%, Balance: {}, Liquidity: {:.2} SOL",
+            token_mint, price, entry.entry_price, entry.highest_price, entry.lowest_price, pnl, retracement, actual_token_balance, current_liquidity
         ));
         
         // Confirm metrics were stored
-        logger.log(format!("Successfully stored metrics for token: {} in TOKEN_METRICS", token_mint).green().to_string());
+        self.logger.log(format!("Successfully stored metrics for token: {} in TOKEN_METRICS", token_mint).green().to_string());
         
         Ok(())
     }
@@ -915,8 +925,16 @@ impl SellingEngine {
             },
         };
         
-        // Calculate time held
-        let time_held = metrics.last_update.elapsed().as_secs();
+        // Calculate time held correctly using buy_timestamp
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let time_held = if metrics.buy_timestamp > 0 {
+            current_time.saturating_sub(metrics.buy_timestamp)
+        } else {
+            metrics.last_update.elapsed().as_secs()
+        };
         
         // Check if we've exceeded the max hold time
         if time_held > self.config.max_hold_time {
@@ -927,6 +945,13 @@ impl SellingEngine {
         
         // Use the current price from metrics (which is updated by update_metrics)
         let current_price = metrics.current_price;
+        
+        // Validate that we have valid price data
+        if current_price <= 0.0 || metrics.entry_price <= 0.0 {
+            self.logger.log(format!("Invalid price data for token {}: current={}, entry={}", 
+                             token_mint, current_price, metrics.entry_price).red().to_string());
+            return Ok((false, false));
+        }
         
         // Calculate percentage change from highest price
         let retracement = if metrics.highest_price > 0.0 {
@@ -944,8 +969,8 @@ impl SellingEngine {
         
         // Log metrics
         self.logger.log(format!(
-            "Token: {}, Current Price: {:.8}, Entry: {:.8}, High: {:.8}, Gain: {:.2}%, Retracement: {:.2}%",
-            token_mint, current_price, metrics.entry_price, metrics.highest_price, gain, retracement
+            "Token: {}, Current Price: {:.8}, Entry: {:.8}, High: {:.8}, Gain: {:.2}%, Retracement: {:.2}%, Time Held: {}s",
+            token_mint, current_price, metrics.entry_price, metrics.highest_price, gain, retracement, time_held
         ).blue().to_string());
         
         // Check if we've reached take profit

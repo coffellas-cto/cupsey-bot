@@ -2974,14 +2974,20 @@ fn evaluate_sell_conditions_fallback(
 ) -> (bool, bool) {
     // Basic fallback logic - sell if we have tokens and certain conditions are met
     
+    // If we don't have any tokens, don't sell
+    if current_token_balance <= 0.0 {
+        return (false, false);
+    }
+    
     // If this is a sell transaction from a large holder or creator, consider selling
     if !parsed_data.is_buy {
-        // Check if this is a large sell (more than 10% of our holdings or large absolute amount)
+        // Check if this is a large sell (more than 20% of our holdings or large absolute amount)
         let sell_amount = parsed_data.token_change.abs();
-        let is_large_sell = sell_amount > current_token_balance * 0.1 || sell_amount > 1000000.0;
+        let is_large_sell = sell_amount > current_token_balance * 0.2 || sell_amount > 10000000.0; // 10M tokens
         
         if is_large_sell {
-            logger.log(format!("Large sell detected: {} tokens sold", sell_amount).red().to_string());
+            logger.log(format!("Large sell detected: {} tokens sold ({}% of our balance)", 
+                sell_amount, (sell_amount / current_token_balance) * 100.0).red().to_string());
             return (true, true); // Emergency sell all
         }
     }
@@ -2994,12 +3000,24 @@ fn evaluate_sell_conditions_fallback(
         }
     }
     
-    // Check liquidity conditions
+    // Check liquidity conditions - be more conservative
     if parsed_data.liquidity > 0.0 {
         let liquidity_sol = parsed_data.liquidity as f64 / 1e9; // Convert lamports to SOL
-        if liquidity_sol < 50.0 { // Less than 50 SOL liquidity
+        if liquidity_sol < 10.0 { // Less than 10 SOL liquidity (more conservative)
+            logger.log(format!("Very low liquidity detected: {:.2} SOL", liquidity_sol).red().to_string());
+            return (true, true); // Emergency sell on very low liquidity
+        } else if liquidity_sol < 25.0 { // Less than 25 SOL liquidity
             logger.log(format!("Low liquidity detected: {:.2} SOL", liquidity_sol).yellow().to_string());
             return (true, false); // Normal sell
+        }
+    }
+    
+    // Check for extreme price movements (if we have price data)
+    if parsed_data.price > 0 {
+        let price_sol = parsed_data.price as f64 / 1e9;
+        if price_sol < 0.00000001 { // Extremely low price
+            logger.log(format!("Extremely low price detected: {:.12} SOL", price_sol).red().to_string());
+            return (true, true); // Emergency sell
         }
     }
     
@@ -3087,10 +3105,14 @@ async fn handle_parsed_data_for_selling(
     let (should_sell, sell_all) = if metrics_updated {
         // Use normal evaluation if metrics were updated successfully
         match selling_engine.evaluate_sell_conditions(&mint).await {
-            Ok(result) => result,
+            Ok(result) => {
+                logger.log(format!("Using enhanced selling strategy evaluation for {}", mint).green().to_string());
+                result
+            },
             Err(e) => {
                 logger.log(format!("Error evaluating sell conditions: {}", e).red().to_string());
                 // Fallback to basic evaluation based on transaction data
+                logger.log("Falling back to basic sell evaluation".yellow().to_string());
                 evaluate_sell_conditions_fallback(&parsed_data, current_token_balance, logger)
             }
         }
@@ -3115,7 +3137,9 @@ async fn handle_parsed_data_for_selling(
             // Emergency sell all tokens immediately to prevent further losses
             logger.log(format!("EMERGENCY SELL ALL triggered for token: {}", mint).red().bold().to_string());
             
-            match selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await {
+            // Try emergency sell first
+            let emergency_result = selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await;
+            match emergency_result {
                 Ok(_) => {
                     logger.log(format!("Successfully executed emergency sell all for token: {}", mint).green().to_string());
                 },
@@ -3123,7 +3147,7 @@ async fn handle_parsed_data_for_selling(
                     logger.log(format!("Error executing emergency sell all: {}", e).red().to_string());
                     // Try fallback to normal execute_sell
                     logger.log("Attempting fallback to normal sell execution".yellow().to_string());
-                    if let Err(fallback_err) = execute_sell(
+                    match execute_sell(
                         mint.clone(),
                         parsed_data.clone(),
                         config.app_state.clone().into(),
@@ -3132,36 +3156,47 @@ async fn handle_parsed_data_for_selling(
                         None,   // Default chunks
                         None,   // Default interval
                     ).await {
-                        logger.log(format!("Fallback sell also failed: {}", fallback_err).red().to_string());
-                        return Err(format!("Both emergency and fallback sells failed: {} / {}", e, fallback_err));
-                    } else {
-                        logger.log("Fallback sell execution succeeded".green().to_string());
+                        Ok(_) => {
+                            logger.log("Fallback sell execution succeeded".green().to_string());
+                        },
+                        Err(fallback_err) => {
+                            logger.log(format!("Fallback sell also failed: {}", fallback_err).red().to_string());
+                            return Err(format!("Both emergency and fallback sells failed: {} / {}", e, fallback_err));
+                        }
                     }
                 }
             }
         } else {
             // Normal selling logic - try emergency sell all first, then fallback to standard sell
             logger.log(format!("Normal sell triggered for token: {}", mint).blue().to_string());
-            if let Err(e) = selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await {
-                logger.log(format!("Emergency sell failed, trying standard sell: {}", e).yellow().to_string());
-                
-                // Fallback to standard sell
-                if let Err(e) = execute_sell(
-                    mint.clone(),
-                    parsed_data.clone(),
-                    config.app_state.clone().into(),
-                    Arc::new(config.swap_config.clone()),
-                    protocol.clone(),
-                    None,   // Default chunks
-                    None,   // Default interval
-                ).await {
-                    logger.log(format!("Error executing standard sell: {}", e).red().to_string());
-                    return Err(format!("Both emergency and standard sell failed: {}", e));
-                } else {
-                    logger.log(format!("Standard sell completed for token: {}", mint).green().to_string());
+            
+            // Try emergency sell first for normal sells too
+            match selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await {
+                Ok(_) => {
+                    logger.log(format!("Emergency sell completed for token: {}", mint).green().to_string());
+                },
+                Err(e) => {
+                    logger.log(format!("Emergency sell failed, trying standard sell: {}", e).yellow().to_string());
+                    
+                    // Fallback to standard sell
+                    match execute_sell(
+                        mint.clone(),
+                        parsed_data.clone(),
+                        config.app_state.clone().into(),
+                        Arc::new(config.swap_config.clone()),
+                        protocol.clone(),
+                        None,   // Default chunks
+                        None,   // Default interval
+                    ).await {
+                        Ok(_) => {
+                            logger.log(format!("Standard sell completed for token: {}", mint).green().to_string());
+                        },
+                        Err(sell_err) => {
+                            logger.log(format!("Error executing standard sell: {}", sell_err).red().to_string());
+                            return Err(format!("Both emergency and standard sell failed: {} / {}", e, sell_err));
+                        }
+                    }
                 }
-            } else {
-                logger.log(format!("Emergency sell completed for token: {}", mint).green().to_string());
             }
         }
         
