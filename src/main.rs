@@ -370,7 +370,41 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
         // Check for command line arguments
-        if args.contains(&"--wrap".to_string()) {
+        if args.contains(&"--test".to_string()) {
+            println!("🧪 Running selling monitor test mode...");
+            
+            // Create DEX IDs for the selling monitor
+            let dex_ids = vec![
+                PUMP_FUN_PROGRAM.to_string(),
+                PUMP_SWAP_PROGRAM.to_string(),
+                RAYDIUM_LAUNCHPAD_PROGRAM.to_string(),
+            ];
+            
+            // Create logger for selling monitor
+            let selling_logger = solana_vntr_sniper::common::logger::Logger::new("[SELLING-TEST] => ".cyan().bold().to_string());
+            
+            // Clone necessary values for the selling monitor task
+            let selling_app_state = config.app_state.clone();
+            let selling_swap_config = Arc::new(config.swap_config.clone());
+            
+            selling_logger.log("Starting selling monitor in test mode...".green().to_string());
+            
+            // Run only the selling monitor
+            match monitor_token_for_selling(
+                dex_ids,
+                selling_app_state.into(),
+                selling_swap_config,
+                &selling_logger,
+            ).await {
+                Ok(_) => {
+                    println!("✅ Selling monitor test completed successfully");
+                },
+                Err(e) => {
+                    eprintln!("❌ Selling monitor test failed: {}", e);
+                }
+            }
+            return;
+        } else if args.contains(&"--wrap".to_string()) {
             println!("Wrapping SOL to WSOL...");
             
             // Get wrap amount from .env
@@ -492,7 +526,7 @@ async fn main() {
         app_state: config.app_state.clone(),
         swap_config: config.swap_config.clone(),
         counter_limit: config.counter_limit as u64,
-        target_addresses,
+        target_addresses, 
         excluded_addresses,
         protocol_preference,
     };
