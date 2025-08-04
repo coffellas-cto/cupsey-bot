@@ -2995,7 +2995,7 @@ fn evaluate_sell_conditions_fallback(
     }
     
     // Check liquidity conditions
-    if parsed_data.liquidity > 0 {
+    if parsed_data.liquidity > 0.0 {
         let liquidity_sol = parsed_data.liquidity as f64 / 1e9; // Convert lamports to SOL
         if liquidity_sol < 50.0 { // Less than 50 SOL liquidity
             logger.log(format!("Low liquidity detected: {:.2} SOL", liquidity_sol).yellow().to_string());
