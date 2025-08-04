@@ -422,25 +422,54 @@ pub async fn start_copy_trading(config: CopyTradingConfig) -> Result<(), String>
     
     // Main stream processing loop
     logger.log("Starting main processing loop...".green().to_string());
-    while let Some(msg_result) = stream.next().await {
-        match msg_result {
-            Ok(msg) => {
-                if let Err(e) = process_message(&msg, &subscribe_tx, config.clone(), &logger).await {
-                    logger.log(format!("Error processing message: {}", e).red().to_string());
+    let stream_result = loop {
+        match stream.next().await {
+            Some(msg_result) => {
+                match msg_result {
+                    Ok(msg) => {
+                        if let Err(e) = process_message(&msg, &subscribe_tx, config.clone(), &logger).await {
+                            logger.log(format!("Error processing message: {}", e).red().to_string());
+                        }
+                    },
+                    Err(e) => {
+                        logger.log(format!("Stream error: {:?}", e).red().to_string());
+                        break "stream_error";
+                    },
                 }
             },
-            Err(e) => {
-                logger.log(format!("Stream error: {:?}", e).red().to_string());
-                // Try to reconnect
-                break;
-            },
+            None => {
+                logger.log("Main stream ended".yellow().to_string());
+                break "stream_ended";
+            }
+        }
+    };
+    
+    // Properly close the main gRPC connection
+    logger.log(format!("Closing main copy trading gRPC connection (reason: {})", stream_result).yellow().to_string());
+    
+    // Drop the subscription sender to close the subscription
+    drop(subscribe_tx);
+    
+    // Drop the stream to close it
+    drop(stream);
+    
+    // The client will be automatically dropped when the function ends, 
+    // but we explicitly drop it here to ensure immediate cleanup
+    drop(client);
+    
+    logger.log("✅ Successfully closed main copy trading gRPC connection".green().to_string());
+    
+    // Return appropriate result
+    match stream_result {
+        "stream_error" => {
+            logger.log("Main stream ended due to error - connection properly closed, will attempt reconnect if needed".yellow().to_string());
+            Err("Main stream error".to_string())
+        },
+        _ => {
+            logger.log("Main stream ended normally - connection properly closed".yellow().to_string());
+            Ok(())
         }
     }
-    
-    logger.log("Stream ended, attempting to reconnect...".yellow().to_string());
-    // Here you would implement reconnection logic
-    
-    Ok(())
 }
 
 /// Verify that a transaction was successful
@@ -1028,55 +1057,82 @@ async fn start_wallet_monitoring_internal(app_state: Arc<AppState>) -> Result<()
         .map_err(|e| format!("Failed to send wallet subscription: {}", e))?;
 
     // Process wallet transactions
-    while let Some(msg_result) = stream.next().await {
-        match msg_result {
-            Ok(msg) => {
-                if let Some(UpdateOneof::Transaction(txn)) = &msg.update_oneof {
-                    if let Some(transaction) = &txn.transaction {
-                        if let signature_bytes = &transaction.signature {
-                            let signature = bs58::encode(signature_bytes).into_string();
-                            
-                            if let Some(meta) = &transaction.meta {
-                                let is_buy = meta.log_messages.iter().any(|log| {
-                                    log.contains("Program log: Instruction: Buy") || log.contains("MintTo")
-                                });
-                                
-                                let is_sell = meta.log_messages.iter().any(|log| {
-                                    log.contains("Program log: Instruction: Sell")
-                                });
-                                
-                                if is_buy {
-                                    logger.log(format!("✅ WALLET BUY CONFIRMED: {}", signature).green().to_string());
-                                }
-                                
-                                if is_sell {
-                                    logger.log(format!("💰 WALLET SELL CONFIRMED: {}", signature).yellow().to_string());
+    let monitor_result = loop {
+        match stream.next().await {
+            Some(msg_result) => {
+                match msg_result {
+                    Ok(msg) => {
+                        if let Some(UpdateOneof::Transaction(txn)) = &msg.update_oneof {
+                            if let Some(transaction) = &txn.transaction {
+                                if let signature_bytes = &transaction.signature {
+                                    let signature = bs58::encode(signature_bytes).into_string();
                                     
-                                    // Try to extract token mint and remove from bought list
-                                    for token_balance in &meta.post_token_balances {
-                                        if token_balance.ui_token_amount.as_ref().map(|ui| ui.ui_amount).unwrap_or(0.0) == 0.0 {
-                                            // This token was sold completely
-                                            BOUGHT_TOKEN_LIST.remove(&token_balance.mint);
-                                            // Remove token from the global tracking system
-                                crate::engine::selling_strategy::TOKEN_METRICS.remove(&token_balance.mint);
-                                crate::engine::selling_strategy::TOKEN_TRACKING.remove(&token_balance.mint);
-                                            logger.log(format!("Removed {} from tracking after confirmed sell", token_balance.mint));
+                                    if let Some(meta) = &transaction.meta {
+                                        let is_buy = meta.log_messages.iter().any(|log| {
+                                            log.contains("Program log: Instruction: Buy") || log.contains("MintTo")
+                                        });
+                                        
+                                        let is_sell = meta.log_messages.iter().any(|log| {
+                                            log.contains("Program log: Instruction: Sell")
+                                        });
+                                        
+                                        if is_buy {
+                                            logger.log(format!("✅ WALLET BUY CONFIRMED: {}", signature).green().to_string());
+                                        }
+                                        
+                                        if is_sell {
+                                            logger.log(format!("💰 WALLET SELL CONFIRMED: {}", signature).yellow().to_string());
+                                            
+                                            // Try to extract token mint and remove from bought list
+                                            for token_balance in &meta.post_token_balances {
+                                                if token_balance.ui_token_amount.as_ref().map(|ui| ui.ui_amount).unwrap_or(0.0) == 0.0 {
+                                                    // This token was sold completely
+                                                    BOUGHT_TOKEN_LIST.remove(&token_balance.mint);
+                                                    // Remove token from the global tracking system
+                                                    crate::engine::selling_strategy::TOKEN_METRICS.remove(&token_balance.mint);
+                                                    crate::engine::selling_strategy::TOKEN_TRACKING.remove(&token_balance.mint);
+                                                    logger.log(format!("Removed {} from tracking after confirmed sell", token_balance.mint));
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
+                    },
+                    Err(e) => {
+                        logger.log(format!("Wallet monitor stream error: {:?}", e).red().to_string());
+                        break "stream_error";
+                    },
                 }
             },
-            Err(e) => {
-                logger.log(format!("Wallet monitor stream error: {:?}", e).red().to_string());
-                return Err(format!("Wallet monitor stream error: {:?}", e));
-            },
+            None => {
+                logger.log("Wallet monitor stream ended".yellow().to_string());
+                break "stream_ended";
+            }
         }
-    }
+    };
     
-    Ok(())
+    // Properly close the gRPC connection
+    logger.log(format!("Closing wallet monitor gRPC connection (reason: {})", monitor_result).yellow().to_string());
+    
+    // Drop the subscription sender to close the subscription
+    drop(subscribe_tx);
+    
+    // Drop the stream to close it
+    drop(stream);
+    
+    // The client will be automatically dropped when the function ends, 
+    // but we explicitly drop it here to ensure immediate cleanup
+    drop(client);
+    
+    logger.log("✅ Successfully closed wallet monitor gRPC connection".green().to_string());
+    
+    // Return error if stream errored, otherwise Ok
+    match monitor_result {
+        "stream_error" => Err("Wallet monitor stream error".to_string()),
+        _ => Ok(())
+    }
 }
 
 
@@ -3207,12 +3263,12 @@ async fn monitor_token_for_selling(
     
     // Main stream processing loop
     logger.log("Starting main processing loop with timer-based selling checks...".green().to_string());
-    loop {
+    let monitoring_result = loop {
         tokio::select! {
             // Check for cancellation
             _ = cancellation_token.cancelled() => {
                 logger.log(format!("Monitoring cancelled for token: {}", token_mint).yellow().to_string());
-                break;
+                break "cancelled";
             }
             // Timer-based selling checks
             _ = selling_timer.tick() => {
@@ -3232,7 +3288,7 @@ async fn monitor_token_for_selling(
                 } else {
                     // Token no longer tracked, exit monitoring
                     logger.log(format!("Token {} no longer tracked, ending monitoring", token_mint).green().to_string());
-                    break;
+                    break "token_sold";
                 }
             }
             // Process stream messages
@@ -3245,18 +3301,31 @@ async fn monitor_token_for_selling(
                     },
                     Some(Err(e)) => {
                         logger.log(format!("Stream error: {:?}", e).red().to_string());
-                        // Try to reconnect
-                        break;
+                        break "stream_error";
                     },
                     None => {
                         logger.log("Stream ended".yellow().to_string());
-                        break;
+                        break "stream_ended";
                     }
                 }
             }
         }
-    }
+    };
     
+    // Properly close the gRPC connection
+    logger.log(format!("Closing gRPC connection for token {} (reason: {})", token_mint, monitoring_result).yellow().to_string());
+    
+    // Drop the subscription sender to close the subscription
+    drop(subscribe_tx);
+    
+    // Drop the stream to close it
+    drop(stream);
+    
+    // The client will be automatically dropped when the function ends, 
+    // but we explicitly drop it here to ensure immediate cleanup
+    drop(client);
+    
+    logger.log(format!("✅ Successfully closed gRPC connection for token: {}", token_mint).green().to_string());
     logger.log(format!("Monitoring task ended for token: {}", token_mint).yellow().to_string());
     
     Ok(())

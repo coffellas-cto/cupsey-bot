@@ -138,23 +138,54 @@ impl WalletMonitor {
 
         // Main wallet monitoring loop
         self.logger.log("Starting wallet transaction monitoring loop...".green().to_string());
-        while let Some(msg_result) = stream.next().await {
-            match msg_result {
-                Ok(msg) => {
-                    if let Err(e) = self.process_wallet_message(&msg).await {
-                        self.logger.log(format!("Error processing wallet message: {}", e).red().to_string());
+        let monitor_result = loop {
+            match stream.next().await {
+                Some(msg_result) => {
+                    match msg_result {
+                        Ok(msg) => {
+                            if let Err(e) = self.process_wallet_message(&msg).await {
+                                self.logger.log(format!("Error processing wallet message: {}", e).red().to_string());
+                            }
+                        },
+                        Err(e) => {
+                            self.logger.log(format!("Wallet monitor stream error: {:?}", e).red().to_string());
+                            break "stream_error";
+                        },
                     }
                 },
-                Err(e) => {
-                    self.logger.log(format!("Wallet monitor stream error: {:?}", e).red().to_string());
-                    // Try to reconnect
-                    break;
-                },
+                None => {
+                    self.logger.log("Wallet monitor stream ended".yellow().to_string());
+                    break "stream_ended";
+                }
+            }
+        };
+        
+        // Properly close the gRPC connection
+        self.logger.log(format!("Closing wallet monitor gRPC connection (reason: {})", monitor_result).yellow().to_string());
+        
+        // Drop the subscription sender to close the subscription
+        drop(subscribe_tx);
+        
+        // Drop the stream to close it
+        drop(stream);
+        
+        // The client will be automatically dropped when the function ends, 
+        // but we explicitly drop it here to ensure immediate cleanup
+        drop(client);
+        
+        self.logger.log("✅ Successfully closed wallet monitor gRPC connection".green().to_string());
+        
+        // Return appropriate result
+        match monitor_result {
+            "stream_error" => {
+                self.logger.log("Wallet monitor stream ended due to error - connection properly closed".yellow().to_string());
+                Err("Wallet monitor stream error".to_string())
+            },
+            _ => {
+                self.logger.log("Wallet monitor stream ended normally - connection properly closed".yellow().to_string());
+                Ok(())
             }
         }
-        
-        self.logger.log("Wallet monitor stream ended, attempting to reconnect...".yellow().to_string());
-        Ok(())
     }
     
     /// Process wallet-specific transaction messages
