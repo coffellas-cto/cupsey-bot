@@ -3102,6 +3102,9 @@ pub async fn monitor_token_for_selling(
     
     logger.log("Connecting to Yellowstone gRPC for selling monitoring...".green().to_string());
     
+
+    println!("DEX IDs for selling monitor: {:?}", dex_ids);
+    
     // Connect to Yellowstone gRPC
     let mut client = GeyserGrpcClient::build_from_shared(yellowstone_grpc_http.clone())
         .map_err(|e| format!("Failed to build client: {}", e))?
