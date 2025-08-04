@@ -28,7 +28,6 @@ use colored::Colorize;
 use spl_token::instruction::sync_native;
 use spl_token::ui_amount_to_amount;
 use spl_associated_token_account::get_associated_token_address;
-use tokio_util::sync::CancellationToken;
 use std::sync::Arc;
 
 /// Initialize the wallet token account list by fetching all token accounts owned by the wallet
@@ -505,16 +504,12 @@ async fn main() {
         RAYDIUM_LAUNCHPAD_PROGRAM.to_string(),
     ];
     
-    // Create cancellation token for selling monitor
-    let selling_monitor_token = CancellationToken::new();
-    
     // Create logger for selling monitor
     let selling_logger = solana_vntr_sniper::common::logger::Logger::new("[SELLING-MONITOR] => ".cyan().bold().to_string());
     
     // Clone necessary values for the selling monitor task
     let selling_app_state = config.app_state.clone();
     let selling_swap_config = Arc::new(config.swap_config.clone());
-    let selling_monitor_token_clone = selling_monitor_token.clone();
     
     // Start both GRPC subscriptions simultaneously
     let copy_trading_task = tokio::spawn(async move {
@@ -529,7 +524,6 @@ async fn main() {
             selling_app_state,
             selling_swap_config,
             &selling_logger,
-            selling_monitor_token_clone,
         ).await {
             eprintln!("Selling monitor error: {}", e);
         }

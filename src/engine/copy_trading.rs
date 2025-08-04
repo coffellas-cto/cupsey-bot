@@ -28,7 +28,6 @@ use crate::common::{
 };
 use crate::engine::swap::{SwapDirection, SwapProtocol};
 
-use tokio_util::sync::CancellationToken;
 use dashmap::DashMap;
 
 // DEX Program constants for monitoring
@@ -275,17 +274,7 @@ async fn send_heartbeat_ping(
     }
 }
 
-/// Clean up tracking for a sold token
-pub async fn cancel_token_monitoring(token_mint: &str, logger: &Logger) -> Result<(), String> {
-    logger.log(format!("Cleaning up tracking for sold token: {}", token_mint));
-    
-    // Remove from token tracking
-    if TOKEN_TRACKING.remove(token_mint).is_some() {
-        logger.log(format!("Removed token from tracking: {}", token_mint));
-    }
-    
-    Ok(())
-}
+
 
 /// Main function to start copy trading
 pub async fn start_copy_trading(config: CopyTradingConfig) -> Result<(), String> {
@@ -2523,9 +2512,7 @@ pub async fn execute_sell(
         logger.log(format!("Removed token account {} from global list after progressive sell", ata));
         
         // Cancel monitoring task for this token since it's been sold
-        if let Err(e) = cancel_token_monitoring(&token_mint, &logger).await {
-            logger.log(format!("Failed to cancel monitoring for token {}: {}", token_mint, e).yellow().to_string());
-        }
+
         
 
         
@@ -2911,10 +2898,6 @@ pub async fn execute_sell(
                 },
                 Err(e) => {
                     logger.log(format!("❌ Error during standard sell cleanup verification: {}", e).red().to_string());
-                    // Fallback to cancel monitoring
-                    if let Err(e) = cancel_token_monitoring(&token_mint, &logger).await {
-                        logger.log(format!("Failed to cancel monitoring for token {}: {}", token_mint, e).yellow().to_string());
-                    }
                 }
             }
             
@@ -3039,10 +3022,7 @@ async fn handle_parsed_data_for_selling(
                     match selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await {
                         Ok(_) => {
                             logger.log(format!("Successfully executed emergency sell all for token: {}", mint).green().to_string());
-                            // Cancel monitoring task for this token since it's been sold
-                            if let Err(e) = cancel_token_monitoring(&mint, &logger).await {
-                                logger.log(format!("Failed to cancel monitoring for token {}: {}", mint, e).yellow().to_string());
-                            }
+
 
                         },
                         Err(e) => {
@@ -3072,18 +3052,10 @@ async fn handle_parsed_data_for_selling(
                         //     None,   // Default interval
                         // ).await {
                         //     logger.log(format!("Error executing standard sell: {}", e).red().to_string());
-                        //     return Err(format!("Failed to sell token: {}", e));
-                        // } else {
-                        //     // Standard sell succeeded, cancel monitoring
-                        //     if let Err(e) = cancel_token_monitoring(&mint, &logger).await {
-                        //         logger.log(format!("Failed to cancel monitoring for token {}: {}", mint, e).yellow().to_string());
-                        //     }
-                        // }
+
                     } else {
-                        // Progressive sell succeeded, cancel monitoring
-                        if let Err(e) = cancel_token_monitoring(&mint, &logger).await {
-                            logger.log(format!("Failed to cancel monitoring for token {}: {}", mint, e).yellow().to_string());
-                        }
+                        // Progressive sell succeeded
+                        logger.log(format!("Progressive sell completed for token: {}", mint).green().to_string());
                     }
                     
 
@@ -3113,7 +3085,6 @@ pub async fn monitor_token_for_selling(
     app_state: Arc<AppState>,
     swap_config: Arc<SwapConfig>,
     logger: &Logger,
-    cancellation_token: CancellationToken,
 ) -> Result<(), String> {
     // Create config for the Yellowstone connection
     // This is a simplified version of what's in the main copy_trading function
@@ -3224,11 +3195,6 @@ pub async fn monitor_token_for_selling(
     logger.log("Starting main processing loop with timer-based selling checks...".green().to_string());
     let monitoring_result = loop {
         tokio::select! {
-            // Check for cancellation
-            _ = cancellation_token.cancelled() => {
-                logger.log(format!("Monitoring cancelled for token: {}", token_mint).yellow().to_string());
-                break "cancelled";
-            }
             // Timer-based selling checks
             _ = selling_timer.tick() => {
                 // Check all bought tokens and update their prices/sell conditions
@@ -3389,11 +3355,6 @@ async fn handle_parsed_data_for_buying(
                 match result {
                     Ok(_) => {
                         logger.log(format!("✅ Successfully executed whale emergency sell for token: {}", parsed_data.mint).green().to_string());
-                        
-                        // Cancel monitoring for this token since it's been sold
-                        if let Err(e) = cancel_token_monitoring(&parsed_data.mint, &logger).await {
-                            logger.log(format!("Failed to cancel monitoring for token {}: {}", parsed_data.mint, e).yellow().to_string());
-                        }
                     },
                     Err(e) => {
                         logger.log(format!("❌ Failed to execute whale emergency sell for token {}: {}", parsed_data.mint, e).red().to_string());
