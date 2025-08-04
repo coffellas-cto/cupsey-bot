@@ -521,7 +521,7 @@ async fn main() {
     let selling_monitor_task = tokio::spawn(async move {
         if let Err(e) = monitor_token_for_selling(
             dex_ids,
-            selling_app_state,
+            selling_app_state.clone(),
             selling_swap_config,
             &selling_logger,
         ).await {
