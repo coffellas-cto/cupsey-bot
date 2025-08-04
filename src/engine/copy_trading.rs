@@ -273,7 +273,7 @@ async fn send_heartbeat_ping(
 }
 
 /// Cancel monitoring task for a sold token and clean up tracking
-async fn cancel_token_monitoring(token_mint: &str, logger: &Logger) -> Result<(), String> {
+pub async fn cancel_token_monitoring(token_mint: &str, logger: &Logger) -> Result<(), String> {
     logger.log(format!("Cancelling monitoring for sold token: {}", token_mint));
     
     // Cancel the monitoring task
@@ -3326,6 +3326,13 @@ async fn monitor_token_for_selling(
     drop(client);
     
     logger.log(format!("✅ Successfully closed gRPC connection for token: {}", token_mint).green().to_string());
+    
+    // Final safety check: ensure this task is removed from MONITORING_TASKS registry
+    if let Some(entry) = MONITORING_TASKS.remove(&token_mint) {
+        logger.log(format!("🧹 Removed monitoring task from registry for token: {}", token_mint).blue().to_string());
+        // The cancellation token is automatically dropped here
+    }
+    
     logger.log(format!("Monitoring task ended for token: {}", token_mint).yellow().to_string());
     
     Ok(())
