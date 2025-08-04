@@ -2966,6 +2966,47 @@ async fn process_message(
     Ok(())  
 }
 
+/// Fallback sell evaluation when metrics are not available or failed to update
+fn evaluate_sell_conditions_fallback(
+    parsed_data: &transaction_parser::TradeInfoFromToken,
+    current_token_balance: f64,
+    logger: &Logger,
+) -> (bool, bool) {
+    // Basic fallback logic - sell if we have tokens and certain conditions are met
+    
+    // If this is a sell transaction from a large holder or creator, consider selling
+    if !parsed_data.is_buy {
+        // Check if this is a large sell (more than 10% of our holdings or large absolute amount)
+        let sell_amount = parsed_data.token_change.abs();
+        let is_large_sell = sell_amount > current_token_balance * 0.1 || sell_amount > 1000000.0;
+        
+        if is_large_sell {
+            logger.log(format!("Large sell detected: {} tokens sold", sell_amount).red().to_string());
+            return (true, true); // Emergency sell all
+        }
+    }
+    
+    // Check for creator sell (if coin_creator data is available)
+    if let Some(creator) = &parsed_data.coin_creator {
+        if !parsed_data.is_buy {
+            logger.log(format!("Creator sell detected from: {}", creator).red().to_string());
+            return (true, true); // Emergency sell all on creator sell
+        }
+    }
+    
+    // Check liquidity conditions
+    if parsed_data.liquidity > 0 {
+        let liquidity_sol = parsed_data.liquidity as f64 / 1e9; // Convert lamports to SOL
+        if liquidity_sol < 50.0 { // Less than 50 SOL liquidity
+            logger.log(format!("Low liquidity detected: {:.2} SOL", liquidity_sol).yellow().to_string());
+            return (true, false); // Normal sell
+        }
+    }
+    
+    // Default: don't sell
+    (false, false)
+}
+
 async fn handle_parsed_data_for_selling(
     parsed_data: transaction_parser::TradeInfoFromToken,
     config: Arc<CopyTradingConfig>,
@@ -2995,80 +3036,138 @@ async fn handle_parsed_data_for_selling(
         SellingConfig::set_from_env(), // SellingConfig::default(), 
     );
     
-    // Update token metrics using the TradeInfoFromToken directly
-    if let Err(e) = selling_engine.update_metrics(&mint, &parsed_data).await {
-        logger.log(format!("Error updating metrics: {}", e).red().to_string());
-    } else {
-        logger.log(format!("Updated metrics for token: {}", mint).green().to_string());
-    }
-    
-    // Check if we should sell this token
-    match selling_engine.evaluate_sell_conditions(&mint).await {
-        Ok((should_sell, sell_all)) => {
-            if should_sell {
-                logger.log(format!("Sell conditions met for token: {}", mint).green().to_string());
-                
-                // Determine protocol to use for selling
-                let protocol = match instruction_type {
-                    transaction_parser::DexType::PumpSwap => SwapProtocol::PumpSwap,
-                    transaction_parser::DexType::PumpFun => SwapProtocol::PumpFun,
-                    _ => config.protocol_preference.clone(),
-                };
-                
-                if sell_all {
-                    // Emergency sell all tokens immediately to prevent further losses
-                    logger.log(format!("EMERGENCY SELL ALL triggered for token: {}", mint).red().bold().to_string());
-                    
-                    match selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await {
-                        Ok(_) => {
-                            logger.log(format!("Successfully executed emergency sell all for token: {}", mint).green().to_string());
-
-
-                        },
-                        Err(e) => {
-                            logger.log(format!("Error executing emergency sell all: {}", e).red().to_string());
-                            
-
-                            
-                            return Err(format!("Failed to execute emergency sell all: {}", e));
-                        }
-                    }
-                } else {
-                    // Normal selling logic - try emergency sell all first, then fallback to standard sell
-                    println!("emergency sell all : token creator: {:?}", parsed_data.coin_creator);
-                    if let Err(e) = selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await {
-                        logger.log(format!("Error executing emergency sell all: {}", e).red().to_string());
-                        
-                        // TODO: This logic might need to be updated later. If emergency sell all fails, try standard sell
-                        // logger.log("Attempting standard sell as fallback".yellow().to_string());
-                        // if let Err(e) = execute_sell(
-                        //     mint.clone(),
-                        //     parsed_data.clone(),
-                        //     config.app_state.clone().into(),
-                        //     Arc::new(config.swap_config.clone()),
-                        //     protocol.clone(),
-                        //     false,  // Not progressive
-                        //     None,   // Default chunks
-                        //     None,   // Default interval
-                        // ).await {
-                        //     logger.log(format!("Error executing standard sell: {}", e).red().to_string());
-
-                    } else {
-                        // Progressive sell succeeded
-                        logger.log(format!("Progressive sell completed for token: {}", mint).green().to_string());
-                    }
-                    
-
-                }
-                
-                logger.log(format!("Successfully processed sell for token: {}", mint).green().to_string());
-            } else {
-                logger.log(format!("Not selling token yet: {}", mint).blue().to_string());
-            }
+    // Always try to update metrics first, but don't fail if it doesn't work
+    let metrics_updated = match selling_engine.update_metrics(&mint, &parsed_data).await {
+        Ok(_) => {
+            logger.log(format!("Successfully updated metrics for token: {}", mint).green().to_string());
+            true
         },
         Err(e) => {
-            logger.log(format!("Error evaluating sell conditions: {}", e).red().to_string());
+            logger.log(format!("Warning: Failed to update metrics for {}: {}", mint, e).yellow().to_string());
+            false
         }
+    };
+    
+    // Check if we actually have tokens to sell first
+    let wallet_pubkey = match config.app_state.wallet.try_pubkey() {
+        Ok(pubkey) => pubkey,
+        Err(e) => {
+            logger.log(format!("Failed to get wallet pubkey: {}", e).red().to_string());
+            return Err(format!("Wallet error: {}", e));
+        }
+    };
+    
+    let token_pubkey = match Pubkey::from_str(&mint) {
+        Ok(pubkey) => pubkey,
+        Err(e) => {
+            logger.log(format!("Invalid token mint address {}: {}", mint, e).red().to_string());
+            return Err(format!("Invalid mint: {}", e));
+        }
+    };
+    
+    let ata = get_associated_token_address(&wallet_pubkey, &token_pubkey);
+    let current_token_balance = match config.app_state.rpc_nonblocking_client.get_token_account(&ata).await {
+        Ok(Some(account)) => {
+            let amount_value = account.token_amount.amount.parse::<f64>().unwrap_or(0.0);
+            amount_value / 10f64.powi(account.token_amount.decimals as i32)
+        },
+        Ok(None) => 0.0,
+        Err(_) => 0.0,
+    };
+    
+    logger.log(format!("Current token balance for {}: {}", mint, current_token_balance).blue().to_string());
+    
+    // If we don't have any tokens, no point in trying to sell
+    if current_token_balance <= 0.0 {
+        logger.log(format!("No tokens to sell for mint: {}", mint).yellow().to_string());
+        return Ok(());
+    }
+    
+    // Try to evaluate sell conditions with fallback logic
+    let (should_sell, sell_all) = if metrics_updated {
+        // Use normal evaluation if metrics were updated successfully
+        match selling_engine.evaluate_sell_conditions(&mint).await {
+            Ok(result) => result,
+            Err(e) => {
+                logger.log(format!("Error evaluating sell conditions: {}", e).red().to_string());
+                // Fallback to basic evaluation based on transaction data
+                evaluate_sell_conditions_fallback(&parsed_data, current_token_balance, logger)
+            }
+        }
+    } else {
+        // Use fallback evaluation if metrics update failed
+        logger.log("Using fallback sell evaluation due to metrics update failure".yellow().to_string());
+        evaluate_sell_conditions_fallback(&parsed_data, current_token_balance, logger)
+    };
+    
+    // Check if we should sell this token
+    if should_sell {
+        logger.log(format!("Sell conditions met for token: {} (sell_all: {})", mint, sell_all).green().to_string());
+        
+        // Determine protocol to use for selling
+        let protocol = match instruction_type {
+            transaction_parser::DexType::PumpSwap => SwapProtocol::PumpSwap,
+            transaction_parser::DexType::PumpFun => SwapProtocol::PumpFun,
+            _ => config.protocol_preference.clone(),
+        };
+        
+        if sell_all {
+            // Emergency sell all tokens immediately to prevent further losses
+            logger.log(format!("EMERGENCY SELL ALL triggered for token: {}", mint).red().bold().to_string());
+            
+            match selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await {
+                Ok(_) => {
+                    logger.log(format!("Successfully executed emergency sell all for token: {}", mint).green().to_string());
+                },
+                Err(e) => {
+                    logger.log(format!("Error executing emergency sell all: {}", e).red().to_string());
+                    // Try fallback to normal execute_sell
+                    logger.log("Attempting fallback to normal sell execution".yellow().to_string());
+                    if let Err(fallback_err) = execute_sell(
+                        mint.clone(),
+                        parsed_data.clone(),
+                        config.app_state.clone().into(),
+                        Arc::new(config.swap_config.clone()),
+                        protocol.clone(),
+                        None,   // Default chunks
+                        None,   // Default interval
+                    ).await {
+                        logger.log(format!("Fallback sell also failed: {}", fallback_err).red().to_string());
+                        return Err(format!("Both emergency and fallback sells failed: {} / {}", e, fallback_err));
+                    } else {
+                        logger.log("Fallback sell execution succeeded".green().to_string());
+                    }
+                }
+            }
+        } else {
+            // Normal selling logic - try emergency sell all first, then fallback to standard sell
+            logger.log(format!("Normal sell triggered for token: {}", mint).blue().to_string());
+            if let Err(e) = selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await {
+                logger.log(format!("Emergency sell failed, trying standard sell: {}", e).yellow().to_string());
+                
+                // Fallback to standard sell
+                if let Err(e) = execute_sell(
+                    mint.clone(),
+                    parsed_data.clone(),
+                    config.app_state.clone().into(),
+                    Arc::new(config.swap_config.clone()),
+                    protocol.clone(),
+                    None,   // Default chunks
+                    None,   // Default interval
+                ).await {
+                    logger.log(format!("Error executing standard sell: {}", e).red().to_string());
+                    return Err(format!("Both emergency and standard sell failed: {}", e));
+                } else {
+                    logger.log(format!("Standard sell completed for token: {}", mint).green().to_string());
+                }
+            } else {
+                logger.log(format!("Emergency sell completed for token: {}", mint).green().to_string());
+            }
+        }
+        
+        logger.log(format!("Successfully processed sell for token: {}", mint).green().to_string());
+    } else {
+        logger.log(format!("No sell conditions met for token: {}", mint).blue().to_string());
     }
     
     logger.log(format!("Processing time for sell transaction: {:?}", start_time.elapsed()).blue().to_string());

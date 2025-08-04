@@ -754,6 +754,11 @@ impl SellingEngine {
             protocol: self.app_state.protocol_preference.clone(),
         });
         
+        logger.log(format!(
+            "Updating metrics for token: {}, is_buy: {}, price: {}, token_balance: {}",
+            token_mint, is_buy, price, actual_token_balance
+        ));
+        
         // Update metrics based on transaction type
         if is_buy {
             // For buys, update entry price using weighted average
@@ -833,6 +838,9 @@ impl SellingEngine {
             token_mint, price, entry.entry_price, entry.highest_price, entry.lowest_price, pnl, actual_token_balance, current_liquidity
         ));
         
+        // Confirm metrics were stored
+        logger.log(format!("Successfully stored metrics for token: {} in TOKEN_METRICS", token_mint).green().to_string());
+        
         Ok(())
     }
     
@@ -901,7 +909,10 @@ impl SellingEngine {
         // Get metrics for the token using DashMap's get() method
         let metrics = match TOKEN_METRICS.get(token_mint) {
             Some(metrics) => metrics.clone(),
-            None => return Ok((false, false)), // No metrics, so nothing to sell
+            None => {
+                self.logger.log(format!("No metrics found for token: {}, cannot evaluate sell conditions", token_mint).red().to_string());
+                return Ok((false, false)); // No metrics, so nothing to sell
+            },
         };
         
         // Calculate time held
