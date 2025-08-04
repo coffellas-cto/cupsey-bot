@@ -31,6 +31,11 @@ use crate::engine::swap::{SwapDirection, SwapProtocol};
 use tokio_util::sync::CancellationToken;
 use dashmap::DashMap;
 
+// DEX Program constants for monitoring
+pub const PUMP_FUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+pub const PUMP_SWAP_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+pub const RAYDIUM_LAUNCHPAD_PROGRAM: &str = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj";
+
 // Enum for different selling actions
 #[derive(Debug, Clone)]
 pub enum SellingAction {
@@ -219,8 +224,6 @@ lazy_static::lazy_static! {
     static ref LAST_BUY_TIME: Arc<DashMap<(), Option<Instant>>> = Arc::new(DashMap::new());
     static ref BUYING_ENABLED: Arc<DashMap<(), bool>> = Arc::new(DashMap::new());
     static ref TOKEN_TRACKING: Arc<DashMap<String, TokenTrackingInfo>> = Arc::new(DashMap::new());
-    // Global registry for monitoring task cancellation tokens
-    static ref MONITORING_TASKS: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
     // New: Bought token list for comprehensive tracking
     static ref BOUGHT_TOKEN_LIST: Arc<DashMap<String, BoughtTokenInfo>> = Arc::new(DashMap::new());
 }
@@ -272,17 +275,9 @@ async fn send_heartbeat_ping(
     }
 }
 
-/// Cancel monitoring task for a sold token and clean up tracking
+/// Clean up tracking for a sold token
 pub async fn cancel_token_monitoring(token_mint: &str, logger: &Logger) -> Result<(), String> {
-    logger.log(format!("Cancelling monitoring for sold token: {}", token_mint));
-    
-    // Cancel the monitoring task
-    if let Some(entry) = MONITORING_TASKS.remove(token_mint) {
-        entry.1.cancel();
-        logger.log(format!("Cancelled monitoring task for token: {}", token_mint));
-    } else {
-        logger.log(format!("No monitoring task found for token: {}", token_mint).yellow().to_string());
-    }
+    logger.log(format!("Cleaning up tracking for sold token: {}", token_mint));
     
     // Remove from token tracking
     if TOKEN_TRACKING.remove(token_mint).is_some() {
@@ -3108,51 +3103,15 @@ async fn handle_parsed_data_for_selling(
     Ok(())
 }
 
-/// Set up selling strategy for a token
-async fn setup_selling_strategy(
-    token_mint: String,
-    app_state: Arc<AppState>,
-    swap_config: Arc<SwapConfig>,
-    protocol_preference: SwapProtocol,
-) -> Result<(), String> {
-    let logger = Logger::new("[SETUP-SELLING-STRATEGY] => ".green().to_string());
-    
-    // Initialize
-    logger.log(format!("Setting up selling strategy for token: {}", token_mint));
-    
-    // Create cancellation token for this monitoring task
-    let cancellation_token = CancellationToken::new();
-    
-    // Register the cancellation token
-    MONITORING_TASKS.insert(token_mint.clone(), cancellation_token.clone());
-    
-    // Clone values that will be moved into the task
-    let token_mint_cloned = token_mint.clone();
-    let app_state_cloned = app_state.clone();
-    let swap_config_cloned = swap_config.clone();
-    let protocol_preference_cloned = protocol_preference.clone();
-    let logger_cloned = logger.clone();
-    
-    // Spawn a task to handle the monitoring and selling
-    tokio::spawn(async move {
-        let _ = monitor_token_for_selling(
-            token_mint_cloned, 
-            app_state_cloned, 
-            swap_config_cloned, 
-            protocol_preference_cloned, 
-            &logger_cloned,
-            cancellation_token
-        ).await;
-    });
-    Ok(())
-}
 
-/// Monitor a token specifically for selling opportunities
-async fn monitor_token_for_selling(
-    token_mint: String,
+
+
+
+/// Monitor tokens for selling opportunities
+pub async fn monitor_token_for_selling(
+    dex_ids: Vec<String>,
     app_state: Arc<AppState>,
     swap_config: Arc<SwapConfig>,
-    protocol_preference: SwapProtocol,
     logger: &Logger,
     cancellation_token: CancellationToken,
 ) -> Result<(), String> {
@@ -3162,11 +3121,11 @@ async fn monitor_token_for_selling(
     let mut yellowstone_grpc_token = "your_token_here".to_string(); // Default value
     
     // Try to get config values from environment if available
-    if let Ok(url) = std::env::var("YELLOWSTONE_GRPC_HTTP") {
+    if let Ok(url) = std::env::var("GRPC_ENDPOINT") {
         yellowstone_grpc_http = url;
     }
     
-    if let Ok(token) = std::env::var("YELLOWSTONE_GRPC_TOKEN") {
+    if let Ok(token) = std::env::var("GRPC_X_TOKEN") {
         yellowstone_grpc_token = token;
     }
     
@@ -3205,14 +3164,14 @@ async fn monitor_token_for_selling(
 
     // Convert to Arc to allow cloning across tasks
     let subscribe_tx = Arc::new(tokio::sync::Mutex::new(subscribe_tx));
-    // Set up subscription focused on the token mint
+    // Set up subscription focused on the DEX programs
     let subscription_request = SubscribeRequest {
         transactions: maplit::hashmap! {
             "TokenMonitor".to_owned() => SubscribeRequestFilterTransactions {
                 vote: Some(false), // Exclude vote transactions
                 failed: Some(false), // Exclude failed transactions
                 signature: None,
-                account_include: vec![token_mint.clone()], // Only include transactions involving our token
+                account_include: dex_ids.clone(), // Only include transactions involving our DEX programs
                 account_exclude: vec![JUPITER_PROGRAM.to_string(), OKX_DEX_PROGRAM.to_string()], // Exclude some common programs
                 account_required: Vec::<String>::new(),
             }
@@ -3236,9 +3195,9 @@ async fn monitor_token_for_selling(
         app_state: (*app_state).clone(),
         swap_config: (*swap_config).clone(),
         counter_limit: 5,
-        target_addresses: vec![token_mint.clone()],
+        target_addresses: vec![], // Not needed for selling monitoring
         excluded_addresses: vec![JUPITER_PROGRAM.to_string(), OKX_DEX_PROGRAM.to_string()],
-        protocol_preference,
+        protocol_preference: SwapProtocol::Auto, // Default value for selling monitoring
     };
 
     let config = Arc::new(copy_trading_config);
@@ -3272,23 +3231,26 @@ async fn monitor_token_for_selling(
             }
             // Timer-based selling checks
             _ = selling_timer.tick() => {
-                // Check if token still exists in tracking
-                if BOUGHT_TOKEN_LIST.contains_key(&token_mint) {
-                    // Update token price first
-                    if let Err(e) = update_token_price(&token_mint, &app_state).await {
-                        logger.log(format!("Failed to update price for {}: {}", token_mint, e).yellow().to_string());
+                // Check all bought tokens and update their prices/sell conditions
+                let tokens_to_check: Vec<String> = BOUGHT_TOKEN_LIST.iter().map(|item| item.key().clone()).collect();
+                
+                if tokens_to_check.is_empty() {
+                    // No tokens to monitor, continue
+                    continue;
+                }
+                
+                for token_mint in tokens_to_check {
+                    if BOUGHT_TOKEN_LIST.contains_key(&token_mint) {
+                        // Update token price first
+                        if let Err(e) = update_token_price(&token_mint, &app_state).await {
+                            logger.log(format!("Failed to update price for {}: {}", token_mint, e).yellow().to_string());
+                        }
+                        
+                        // Execute threshold-based progressive selling (copy_trading.rs system)
+                        if let Err(e) = execute_enhanced_sell(token_mint.clone(), app_state.clone(), swap_config.clone()).await {
+                            logger.log(format!("Timer-based threshold selling check error for {}: {}", token_mint, e).yellow().to_string());
+                        }
                     }
-                    
-                    // Execute threshold-based progressive selling (copy_trading.rs system)
-                    if let Err(e) = execute_enhanced_sell(token_mint.clone(), app_state.clone(), swap_config.clone()).await {
-                        logger.log(format!("Timer-based threshold selling check error for {}: {}", token_mint, e).yellow().to_string());
-                    }
-                    
-
-                } else {
-                    // Token no longer tracked, exit monitoring
-                    logger.log(format!("Token {} no longer tracked, ending monitoring", token_mint).green().to_string());
-                    break "token_sold";
                 }
             }
             // Process stream messages
@@ -3313,7 +3275,7 @@ async fn monitor_token_for_selling(
     };
     
     // Properly close the gRPC connection
-    logger.log(format!("Closing gRPC connection for token {} (reason: {})", token_mint, monitoring_result).yellow().to_string());
+    logger.log(format!("Closing gRPC connection for selling monitor (reason: {})", monitoring_result).yellow().to_string());
     
     // Drop the subscription sender to close the subscription
     drop(subscribe_tx);
@@ -3325,15 +3287,9 @@ async fn monitor_token_for_selling(
     // but we explicitly drop it here to ensure immediate cleanup
     drop(client);
     
-    logger.log(format!("✅ Successfully closed gRPC connection for token: {}", token_mint).green().to_string());
+    logger.log("✅ Successfully closed gRPC connection for selling monitor".green().to_string());
     
-    // Final safety check: ensure this task is removed from MONITORING_TASKS registry
-    if let Some(entry) = MONITORING_TASKS.remove(&token_mint) {
-        logger.log(format!("🧹 Removed monitoring task from registry for token: {}", token_mint).blue().to_string());
-        // The cancellation token is automatically dropped here
-    }
-    
-    logger.log(format!("Monitoring task ended for token: {}", token_mint).yellow().to_string());
+    logger.log("Selling monitoring task ended".yellow().to_string());
     
     Ok(())
 }
@@ -3530,27 +3486,13 @@ async fn handle_parsed_data_for_buying(
                 logger.log(format!("copied transaction {}", target_signature.clone().unwrap_or_default()).blue().to_string());
                 logger.log(format!("Now starting to monitor this token to sell at a profit").blue().to_string());
                 
-                // Wait for buy transaction to be confirmed and processed before starting selling monitor
-                // This prevents race condition where selling monitor starts before entry_price is set
+                // Wait for buy transaction to be confirmed and processed
                 logger.log("Waiting 2 seconds for buy transaction to be fully processed...".yellow().to_string());
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 
-                // Setup selling strategy based on take profit and stop loss
-                match setup_selling_strategy(
-                    parsed_data.mint.clone(), 
-                    config.app_state.clone().into(), 
-                    Arc::new(config.swap_config.clone()), 
-                    protocol.clone(),
-                ).await {
-                    Ok(_) => {
-                        logger.log("Selling strategy set up successfully".green().to_string());
-                        Ok(())
-                    },
-                    Err(e) => {
-                        logger.log(format!("Failed to set up selling strategy: {}", e).red().to_string());
-                        Err(e)
-                    }
-                }
+                // Token will be monitored by the separate selling monitor running in parallel
+                logger.log("Token added to BOUGHT_TOKEN_LIST for monitoring by selling strategy".green().to_string());
+                Ok(())
             }
         }
     } else {
@@ -3656,11 +3598,7 @@ async fn verify_sell_transaction_and_cleanup(
             removed_systems.push("TOKEN_METRICS");
         }
         
-        // Cancel monitoring task
-        if let Some(entry) = MONITORING_TASKS.remove(token_mint) {
-            entry.1.cancel();
-            removed_systems.push("MONITORING_TASKS");
-        }
+        // Note: Monitoring tasks are now handled by the global selling monitor
         
         // Remove from wallet token accounts
         if let Ok(wallet_pubkey) = app_state.wallet.try_pubkey() {

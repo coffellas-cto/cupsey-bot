@@ -366,14 +366,6 @@ impl TokenManager {
         if TOKEN_METRICS.remove(token_mint).is_some() {
             // Also remove from tracking
             TOKEN_TRACKING.remove(token_mint);
-            
-            // Cancel monitoring task for this token to close gRPC connection
-            if let Err(e) = crate::engine::copy_trading::cancel_token_monitoring(token_mint, &self.logger).await {
-                self.logger.log(format!("Failed to cancel monitoring for removed token {}: {}", token_mint, e).yellow().to_string());
-            } else {
-                self.logger.log(format!("✅ Cancelled gRPC monitoring for removed token: {}", token_mint).green().to_string());
-            }
-            
             self.logger.log(format!("Removed token from tracking: {}", token_mint));
         } else {
             self.logger.log(format!("Token not found for removal: {}", token_mint));
@@ -419,17 +411,10 @@ impl TokenManager {
                             removed_systems.push("TOKEN_TRACKING");
                         }
                         
-                        // Cancel monitoring task for this token to close gRPC connection
-                        if let Err(e) = crate::engine::copy_trading::cancel_token_monitoring(&token_mint, &self.logger).await {
-                            self.logger.log(format!("Failed to cancel monitoring for token {}: {}", token_mint, e).yellow().to_string());
-                        } else {
-                            removed_systems.push("MONITORING_TASKS");
-                        }
-                        
                         if !removed_systems.is_empty() {
                             cleaned_count += 1;
                             self.logger.log(format!(
-                                "🧹 Selling strategy cleanup removed {} from: [{}] and cancelled gRPC monitoring", 
+                                "🧹 Selling strategy cleanup removed {} from: [{}]", 
                                 token_mint, 
                                 removed_systems.join(", ")
                             ).green().to_string());
@@ -1803,13 +1788,6 @@ impl SellingEngine {
             // Remove token from tracking since we sold everything
             WALLET_TOKEN_ACCOUNTS.remove(&ata);
             self.logger.log(format!("Removed token account {} from global list after emergency sell", ata));
-            
-            // Cancel monitoring task for this token to close gRPC connection
-            if let Err(e) = crate::engine::copy_trading::cancel_token_monitoring(token_mint, &self.logger).await {
-                self.logger.log(format!("Failed to cancel monitoring for emergency sold token {}: {}", token_mint, e).yellow().to_string());
-            } else {
-                self.logger.log(format!("✅ Cancelled gRPC monitoring for emergency sold token: {}", token_mint).green().to_string());
-            }
             
             // Record the emergency trade execution
             if let Err(e) = self.record_trade_execution(
