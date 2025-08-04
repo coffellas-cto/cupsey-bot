@@ -3100,7 +3100,7 @@ pub async fn monitor_token_for_selling(
         yellowstone_grpc_token = token;
     }
     
-    logger.log("Connecting to Yellowstone gRPC for selling, will close connection after selling ...".green().to_string());
+    logger.log("Connecting to Yellowstone gRPC for selling monitoring...".green().to_string());
     
     // Connect to Yellowstone gRPC
     let mut client = GeyserGrpcClient::build_from_shared(yellowstone_grpc_http.clone())
@@ -3240,22 +3240,8 @@ pub async fn monitor_token_for_selling(
         }
     };
     
-    // Properly close the gRPC connection
-    logger.log(format!("Closing gRPC connection for selling monitor (reason: {})", monitoring_result).yellow().to_string());
-    
-    // Drop the subscription sender to close the subscription
-    drop(subscribe_tx);
-    
-    // Drop the stream to close it
-    drop(stream);
-    
-    // The client will be automatically dropped when the function ends, 
-    // but we explicitly drop it here to ensure immediate cleanup
-    drop(client);
-    
-    logger.log("✅ Successfully closed gRPC connection for selling monitor".green().to_string());
-    
-    logger.log("Selling monitoring task ended".yellow().to_string());
+    // Keep the gRPC connection alive - don't close it
+    logger.log(format!("Selling monitoring task ended (reason: {}) - keeping gRPC connection alive", monitoring_result).yellow().to_string());
     
     Ok(())
 }
