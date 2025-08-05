@@ -2967,7 +2967,7 @@ async fn handle_parsed_data_for_selling(
     
     // Check if we should sell this token
     match selling_engine.evaluate_sell_conditions(&mint).await {
-        Ok((should_sell, sell_all)) => {
+        Ok((should_sell, sell_all, use_whale_emergency)) => {
             if should_sell {
                 logger.log(format!("Sell conditions met for token: {}", mint).green().to_string());
                 
@@ -2979,24 +2979,92 @@ async fn handle_parsed_data_for_selling(
                 };
                 
                 if sell_all {
-                    // Emergency sell all tokens immediately to prevent further losses
-                    logger.log(format!("EMERGENCY SELL ALL triggered for token: {}", mint).red().bold().to_string());
-                    
-                    match selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await {
-                        Ok(_) => {
-                            logger.log(format!("Successfully executed emergency sell all for token: {}", mint).green().to_string());
-                            // Cancel monitoring task for this token since it's been sold
-                            if let Err(e) = cancel_token_monitoring(&mint, &logger).await {
-                                logger.log(format!("Failed to cancel monitoring for token {}: {}", mint, e).yellow().to_string());
+                    if use_whale_emergency {
+                        // Whale emergency sell using zeroslot for maximum speed
+                        logger.log(format!("🐋 WHALE EMERGENCY SELL triggered for token: {}", mint).cyan().bold().to_string());
+                        
+                        // Get the current PNL to determine whale threshold
+                        if let Some(metrics) = crate::engine::selling_strategy::TOKEN_METRICS.get(&mint) {
+                            let pnl = if metrics.entry_price > 0.0 {
+                                (metrics.current_price - metrics.entry_price) / metrics.entry_price * 100.0
+                            } else {
+                                0.0
+                            };
+                            
+                            if let Some(whale_threshold) = selling_engine.config.dynamic_whale_selling.get_whale_threshold_for_pnl(pnl) {
+                                match selling_engine.whale_emergency_sell(&mint, &parsed_data, protocol.clone(), whale_threshold).await {
+                                    Ok(_) => {
+                                        logger.log(format!("🐋 Successfully executed whale emergency sell for token: {}", mint).green().bold().to_string());
+                                        // Cancel monitoring task for this token since it's been sold
+                                        if let Err(e) = cancel_token_monitoring(&mint, &logger).await {
+                                            logger.log(format!("Failed to cancel monitoring for token {}: {}", mint, e).yellow().to_string());
+                                        }
+                                    },
+                                    Err(e) => {
+                                        logger.log(format!("🐋 Error executing whale emergency sell: {}", e).red().to_string());
+                                        
+                                        // Fallback to regular emergency sell
+                                        logger.log("Falling back to regular emergency sell".yellow().to_string());
+                                        match selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await {
+                                            Ok(_) => {
+                                                logger.log(format!("Successfully executed fallback emergency sell for token: {}", mint).green().to_string());
+                                                if let Err(e) = cancel_token_monitoring(&mint, &logger).await {
+                                                    logger.log(format!("Failed to cancel monitoring for token {}: {}", mint, e).yellow().to_string());
+                                                }
+                                            },
+                                            Err(e) => {
+                                                logger.log(format!("Error executing fallback emergency sell: {}", e).red().to_string());
+                                                return Err(format!("Failed to execute emergency sell: {}", e));
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                logger.log(format!("🐋 No whale threshold found for PNL {:.2}%, using regular emergency sell", pnl).yellow().to_string());
+                                match selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await {
+                                    Ok(_) => {
+                                        logger.log(format!("Successfully executed emergency sell for token: {}", mint).green().to_string());
+                                        if let Err(e) = cancel_token_monitoring(&mint, &logger).await {
+                                            logger.log(format!("Failed to cancel monitoring for token {}: {}", mint, e).yellow().to_string());
+                                        }
+                                    },
+                                    Err(e) => {
+                                        logger.log(format!("Error executing emergency sell: {}", e).red().to_string());
+                                        return Err(format!("Failed to execute emergency sell: {}", e));
+                                    }
+                                }
                             }
-
-                        },
-                        Err(e) => {
-                            logger.log(format!("Error executing emergency sell all: {}", e).red().to_string());
-                            
-
-                            
-                            return Err(format!("Failed to execute emergency sell all: {}", e));
+                        } else {
+                            logger.log("🐋 No metrics found for whale emergency sell, using regular emergency sell".yellow().to_string());
+                            match selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await {
+                                Ok(_) => {
+                                    logger.log(format!("Successfully executed emergency sell for token: {}", mint).green().to_string());
+                                    if let Err(e) = cancel_token_monitoring(&mint, &logger).await {
+                                        logger.log(format!("Failed to cancel monitoring for token {}: {}", mint, e).yellow().to_string());
+                                    }
+                                },
+                                Err(e) => {
+                                    logger.log(format!("Error executing emergency sell: {}", e).red().to_string());
+                                    return Err(format!("Failed to execute emergency sell: {}", e));
+                                }
+                            }
+                        }
+                    } else {
+                        // Regular emergency sell all tokens immediately to prevent further losses
+                        logger.log(format!("EMERGENCY SELL ALL triggered for token: {}", mint).red().bold().to_string());
+                        
+                        match selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await {
+                            Ok(_) => {
+                                logger.log(format!("Successfully executed emergency sell all for token: {}", mint).green().to_string());
+                                // Cancel monitoring task for this token since it's been sold
+                                if let Err(e) = cancel_token_monitoring(&mint, &logger).await {
+                                    logger.log(format!("Failed to cancel monitoring for token {}: {}", mint, e).yellow().to_string());
+                                }
+                            },
+                            Err(e) => {
+                                logger.log(format!("Error executing emergency sell all: {}", e).red().to_string());
+                                return Err(format!("Failed to execute emergency sell all: {}", e));
+                            }
                         }
                     }
                 } else {
