@@ -273,8 +273,8 @@ pub struct SellingConfig {
 impl Default for SellingConfig {
     fn default() -> Self {
         Self {
-            take_profit: 50.0,               // 50% profit target  
-            stop_loss: -20.0,                // 20% stop loss
+            take_profit: 25.0,               // 25% profit target  
+            stop_loss: -30.0,                // 30% stop loss
             max_hold_time: 86400,            // 24 hours max hold time
             retracement_threshold: 15.0,     // 15% retracement threshold
             min_liquidity: 1.0,              // 1 SOL minimum liquidity
@@ -291,8 +291,8 @@ impl Default for SellingConfig {
 
 impl SellingConfig {
     pub fn set_from_env() -> Self {
-        let take_profit = import_env_var("TAKE_PROFIT").parse::<f64>().unwrap_or(50.0);
-        let stop_loss = import_env_var("STOP_LOSS").parse::<f64>().unwrap_or(-20.0);
+        let take_profit = import_env_var("TAKE_PROFIT").parse::<f64>().unwrap_or(25.0);
+        let stop_loss = import_env_var("STOP_LOSS").parse::<f64>().unwrap_or(-30.0);
         let max_hold_time = import_env_var("MAX_HOLD_TIME").parse::<u64>().unwrap_or(86400);
         let retracement_threshold = import_env_var("RETRACEMENT_THRESHOLD").parse::<f64>().unwrap_or(15.0);
         let min_liquidity = import_env_var("MIN_LIQUIDITY").parse::<f64>().unwrap_or(1.0);
@@ -617,6 +617,118 @@ impl SellingEngine {
             logger: Logger::new("[SELLING-STRATEGY] => ".yellow().to_string()),
             token_manager: TokenManager::new(),
         }
+    }
+    
+    /// Log current selling strategy parameters
+    pub fn log_selling_parameters(&self) {
+        self.logger.log("📊 SELLING STRATEGY PARAMETERS:".cyan().bold().to_string());
+        self.logger.log(format!("  🎯 Take Profit: {:.1}%", self.config.take_profit).green().to_string());
+        self.logger.log(format!("  🛑 Stop Loss: {:.1}%", self.config.stop_loss).red().to_string());
+        self.logger.log(format!("  ⏰ Max Hold Time: {} hours", self.config.max_hold_time / 3600).blue().to_string());
+        self.logger.log(format!("  📉 Retracement Threshold: {:.1}%", self.config.retracement_threshold).yellow().to_string());
+        self.logger.log(format!("  💧 Min Liquidity: {:.1} SOL", self.config.min_liquidity).purple().to_string());
+        self.logger.log("  ⚠️  Trailing Stop: DISABLED".red().to_string());
+        self.logger.log("  🚫 Token Rebuying: DISABLED (permanent blacklist)".red().to_string());
+        self.logger.log("  🚀 Copy Selling Method: ZEROSLOT".green().to_string());
+    }
+    
+    /// Check for existing token balances and initialize them for copy selling
+    pub async fn initialize_copy_selling_for_existing_tokens(&self) -> Result<usize> {
+        self.logger.log("🔍 Checking for existing token balances to initialize copy selling...".cyan().to_string());
+        
+        let wallet_pubkey = self.app_state.wallet.try_pubkey()
+            .map_err(|e| anyhow!("Failed to get wallet pubkey: {}", e))?;
+        
+        // Get all token accounts owned by the wallet
+        let token_program = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+            .map_err(|e| anyhow!("Invalid token program pubkey: {}", e))?;
+        
+        let accounts = self.app_state.rpc_client.get_token_accounts_by_owner(
+            &wallet_pubkey,
+            anchor_client::solana_client::rpc_request::TokenAccountsFilter::ProgramId(token_program)
+        ).map_err(|e| anyhow!("Failed to get token accounts: {}", e))?;
+        
+        let mut initialized_count = 0;
+        
+        for account_info in accounts {
+            // Parse token account
+            let token_account_pubkey = Pubkey::from_str(&account_info.pubkey)
+                .map_err(|e| anyhow!("Invalid token account pubkey: {}", e))?;
+            
+            // Get account data
+            let account_data = self.app_state.rpc_client.get_account(&token_account_pubkey)
+                .map_err(|e| anyhow!("Failed to get account data: {}", e))?;
+            
+            // Parse token account data
+            if let Ok(parsed_account) = spl_token::state::Account::unpack(&account_data.data) {
+                let token_mint = parsed_account.mint.to_string();
+                let token_amount = parsed_account.amount as f64 / 10f64.powi(9); // Assume 9 decimals for simplicity
+                
+                // Skip WSOL and very small amounts
+                if parsed_account.mint == spl_token::native_mint::id() || token_amount <= 0.000001 {
+                    continue;
+                }
+                
+                // Skip if already being tracked
+                if TOKEN_METRICS.contains_key(&token_mint) {
+                    continue;
+                }
+                
+                self.logger.log(format!("📦 Found existing token balance: {} ({:.6} tokens)", token_mint, token_amount).blue().to_string());
+                
+                // Create basic token metrics for existing balance (use current price as entry price approximation)
+                let current_price = match self.get_current_price(&token_mint).await {
+                    Ok(price) => price,
+                    Err(_) => {
+                        self.logger.log(format!("⚠️  Could not get price for {}, skipping", token_mint).yellow().to_string());
+                        continue;
+                    }
+                };
+                
+                let metrics = TokenMetrics {
+                    entry_price: current_price, // Use current price as approximation
+                    highest_price: current_price,
+                    lowest_price: current_price,
+                    current_price,
+                    volume_24h: 0.0,
+                    market_cap: 0.0,
+                    time_held: 0,
+                    last_update: Instant::now(),
+                    buy_timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    amount_held: token_amount,
+                    cost_basis: current_price * token_amount,
+                    price_history: VecDeque::new(),
+                    volume_history: VecDeque::new(),
+                    liquidity_at_entry: 0.0, // Unknown for existing tokens
+                    liquidity_at_current: 0.0, // Will be updated
+                    protocol: SwapProtocol::Auto, // Unknown protocol for existing tokens
+                };
+                
+                // Add to tracking
+                TOKEN_METRICS.insert(token_mint.clone(), metrics);
+                TOKEN_TRACKING.insert(token_mint.clone(), TokenTrackingInfo {
+                    top_pnl: 0.0,
+                    last_sell_time: Instant::now(),
+                    completed_intervals: HashSet::new(),
+                    sell_attempts: 0,
+                    sell_success: 0,
+                });
+                
+                initialized_count += 1;
+                self.logger.log(format!("✅ Initialized copy selling for existing token: {}", token_mint).green().to_string());
+            }
+        }
+        
+        if initialized_count > 0 {
+            self.logger.log(format!("🎯 Copy selling initialized for {} existing tokens", initialized_count).green().bold().to_string());
+        } else {
+            self.logger.log("📭 No existing token balances found to initialize for copy selling".blue().to_string());
+        }
+        
+        Ok(initialized_count)
     }
     
     /// Get the token manager
@@ -951,29 +1063,16 @@ impl SellingEngine {
             return Ok((true, true));
         }
         
-        // Improved Trailing Stop Logic
-        let trailing_stop_activation_threshold = self.config.trailing_stop.activation_percentage;
-        let trailing_stop_percentage = self.config.trailing_stop.trail_percentage;
+        // Trailing Stop Logic - DISABLED
+        // Note: Trailing stop functionality has been removed per requirements
         
-        // Only activate trailing stop if we've reached minimum profit threshold
-        if gain >= trailing_stop_activation_threshold {
-            // Check if price has dropped from highest by more than trailing stop percentage
-            if retracement >= trailing_stop_percentage {
-                self.logger.log(format!(
-                    "Trailing stop triggered: {:.2}% drop from high (threshold: {:.2}%, current gain: {:.2}%)",
-                    retracement, trailing_stop_percentage, gain
-                ).red().to_string());
-                return Ok((true, false));
-            }
-        } else {
-            // Use retracement threshold as fallback for tokens that haven't reached trailing stop activation
-            if retracement >= self.config.retracement_threshold && gain > 0.0 {
-                self.logger.log(format!(
-                    "Selling due to excessive retracement: {:.2}% >= {:.2}% (still in profit: {:.2}%)",
-                    retracement, self.config.retracement_threshold, gain
-                ).yellow().to_string());
-                return Ok((true, false));
-            }
+        // Use retracement threshold as fallback (only if still in profit)
+        if retracement >= self.config.retracement_threshold && gain > 0.0 {
+            self.logger.log(format!(
+                "Selling due to excessive retracement: {:.2}% >= {:.2}% (still in profit: {:.2}%)",
+                retracement, self.config.retracement_threshold, gain
+            ).yellow().to_string());
+            return Ok((true, false));
         }
 
         // Enhanced liquidity monitoring
@@ -1603,9 +1702,9 @@ impl SellingEngine {
                             }
                         };
                         self.logger.log(format!("Generated emergency PumpFun sell instruction at price: {}", price));
-                        // Execute with normal transaction method
-                        match crate::core::tx::new_signed_and_send_normal(
-                            self.app_state.rpc_nonblocking_client.clone(),
+                        // Execute with zeroslot for copy selling
+                        match crate::core::tx::new_signed_and_send_zeroslot(
+                            self.app_state.zeroslot_rpc_client.clone(),
                             recent_blockhash,
                             &keypair,
                             instructions,
@@ -1653,9 +1752,9 @@ impl SellingEngine {
                             }
                         };
                         self.logger.log(format!("Generated emergency PumpSwap sell instruction at price: {}", price));
-                        // Execute with normal transaction method
-                        match crate::core::tx::new_signed_and_send_normal(
-                            self.app_state.rpc_nonblocking_client.clone(),
+                        // Execute with zeroslot for copy selling
+                        match crate::core::tx::new_signed_and_send_zeroslot(
+                            self.app_state.zeroslot_rpc_client.clone(),
                             recent_blockhash,
                             &keypair,
                             instructions,
@@ -1703,9 +1802,9 @@ impl SellingEngine {
                             }
                         };
                         self.logger.log(format!("Generated emergency Raydium sell instruction at price: {}", price));
-                        // Execute with normal transaction method
-                        match crate::core::tx::new_signed_and_send_normal(
-                            self.app_state.rpc_nonblocking_client.clone(),
+                        // Execute with zeroslot for copy selling
+                        match crate::core::tx::new_signed_and_send_zeroslot(
+                            self.app_state.zeroslot_rpc_client.clone(),
                             recent_blockhash,
                             &keypair,
                             instructions,
@@ -1752,8 +1851,8 @@ impl SellingEngine {
                             }
                         };
                         self.logger.log(format!("Generated emergency PumpFun sell instruction at price: {}", price));
-                        match crate::core::tx::new_signed_and_send_normal(
-                            self.app_state.rpc_nonblocking_client.clone(),
+                        match crate::core::tx::new_signed_and_send_zeroslot(
+                            self.app_state.zeroslot_rpc_client.clone(),
                             recent_blockhash,
                             &keypair,
                             instructions,

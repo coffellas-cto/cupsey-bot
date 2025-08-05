@@ -169,13 +169,13 @@ impl BoughtTokenInfo {
         
         let time_since_buy = self.buy_timestamp.elapsed().as_secs();
         
-        // Rule 1: Stop Loss - sell if loss exceeds 10%
-        if self.pnl_percentage <= -10.0 {
+        // Rule 1: Stop Loss - sell if loss exceeds 30%
+        if self.pnl_percentage <= -30.0 {
             return SellingAction::SellAll(format!("Stop loss triggered: {:.2}% loss", self.pnl_percentage));
         }
         
-        // Rule 2: Take Profit - sell if profit exceeds 100%
-        if self.pnl_percentage >= 100.0 {
+        // Rule 2: Take Profit - sell if profit exceeds 25%
+        if self.pnl_percentage >= 25.0 {
             return SellingAction::SellAll(format!("Take profit triggered: {:.2}% profit", self.pnl_percentage));
         }
         
@@ -184,13 +184,8 @@ impl BoughtTokenInfo {
             return SellingAction::SellAll(format!("Max hold time reached: {} hours", time_since_buy / 3600));
         }
         
-        // Rule 4: Trailing Stop Logic
-        if self.should_sell_due_to_trailing_stop() {
-            return SellingAction::SellAll(format!(
-                "Trailing stop triggered ({}% drop from high)",
-                self.trailing_stop_percentage
-            ));
-        }
+        // Rule 4: Trailing Stop Logic - DISABLED per requirements
+        // Note: Trailing stop functionality has been removed
         
         SellingAction::Hold
     }
@@ -223,6 +218,8 @@ lazy_static::lazy_static! {
     static ref MONITORING_TASKS: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
     // New: Bought token list for comprehensive tracking
     static ref BOUGHT_TOKEN_LIST: Arc<DashMap<String, BoughtTokenInfo>> = Arc::new(DashMap::new());
+    // Add: Permanent blacklist for tokens that have been bought before (never rebuy)
+    static ref BOUGHT_TOKENS_BLACKLIST: Arc<DashMap<String, u64>> = Arc::new(DashMap::new());
 }
 
 // Initialize the global counters with default values
@@ -507,6 +504,12 @@ pub async fn execute_buy(
     let logger = Logger::new("[EXECUTE-BUY] => ".green().to_string());
     let start_time = Instant::now();
     
+    // Check if this token is in the permanent blacklist (never rebuy)
+    if BOUGHT_TOKENS_BLACKLIST.contains_key(&trade_info.mint) {
+        logger.log(format!("🚫 Token {} is blacklisted (previously bought), skipping buy", trade_info.mint).yellow().to_string());
+        return Err("Token is blacklisted - previously bought".to_string());
+    }
+    
     // Create a modified swap config based on the trade_info
     let mut buy_config = (*swap_config).clone();
     buy_config.swap_direction = SwapDirection::Buy;
@@ -616,6 +619,14 @@ pub async fn execute_buy(
                                             );
                                             BOUGHT_TOKEN_LIST.insert(trade_info.mint.clone(), bought_token_info);
                                             logger.log(format!("Added {} to enhanced tracking system (PumpFun)", trade_info.mint));
+                                            
+                                            // Add to permanent blacklist (never rebuy this token)
+                                            let timestamp = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs();
+                                            BOUGHT_TOKENS_BLACKLIST.insert(trade_info.mint.clone(), timestamp);
+                                            logger.log(format!("🚫 Added {} to permanent blacklist", trade_info.mint));
                                         }
                                         
                                         
@@ -708,6 +719,14 @@ pub async fn execute_buy(
                                             );
                                             BOUGHT_TOKEN_LIST.insert(trade_info.mint.clone(), bought_token_info);
                                             logger.log(format!("Added {} to enhanced tracking system (PumpSwap)", trade_info.mint));
+                                            
+                                            // Add to permanent blacklist (never rebuy this token)
+                                            let timestamp = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs();
+                                            BOUGHT_TOKENS_BLACKLIST.insert(trade_info.mint.clone(), timestamp);
+                                            logger.log(format!("🚫 Added {} to permanent blacklist", trade_info.mint));
                                         }
                                         
                                         Ok(())
@@ -795,6 +814,14 @@ pub async fn execute_buy(
                                             );
                                             BOUGHT_TOKEN_LIST.insert(trade_info.mint.clone(), bought_token_info);
                                             logger.log(format!("Added {} to enhanced tracking system (Raydium)", trade_info.mint));
+                                            
+                                            // Add to permanent blacklist (never rebuy this token)
+                                            let timestamp = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs();
+                                            BOUGHT_TOKENS_BLACKLIST.insert(trade_info.mint.clone(), timestamp);
+                                            logger.log(format!("🚫 Added {} to permanent blacklist", trade_info.mint));
                                         }
                                         
                                         Ok(())
@@ -887,6 +914,14 @@ pub async fn execute_buy(
                                             BOUGHT_TOKEN_LIST.insert(trade_info.mint.clone(), bought_token_info);
                                             logger.log(format!("Added {} to bought tokens tracking", trade_info.mint));
                                             
+                                            // Add to permanent blacklist (never rebuy this token)
+                                            let timestamp = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs();
+                                            BOUGHT_TOKENS_BLACKLIST.insert(trade_info.mint.clone(), timestamp);
+                                            logger.log(format!("🚫 Added {} to permanent blacklist", trade_info.mint));
+                                            
                                             // Start enhanced selling monitor for this token
                                             let app_state_clone = app_state.clone();
                                             let swap_config_clone = swap_config.clone();
@@ -950,6 +985,14 @@ pub async fn execute_buy(
         // Only add to tracking if entry_price is valid
         if bought_token_info.entry_price > 0 {
             BOUGHT_TOKEN_LIST.insert(trade_info.mint.clone(), bought_token_info);
+            
+            // Add to permanent blacklist (never rebuy this token)
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            BOUGHT_TOKENS_BLACKLIST.insert(trade_info.mint.clone(), timestamp);
+            logger.log(format!("🚫 Added {} to permanent blacklist", trade_info.mint));
         } else {
             println!("WARNING: Refusing to track token {} with entry_price = 0", trade_info.mint);
         }

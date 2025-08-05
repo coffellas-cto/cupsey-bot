@@ -424,6 +424,27 @@ async fn main() {
     cache_maintenance::start_cache_maintenance(60).await;
     println!("Cache maintenance service started");
 
+    // Initialize and log selling strategy parameters
+    let selling_config = solana_vntr_sniper::engine::selling_strategy::SellingConfig::set_from_env();
+    let selling_engine = solana_vntr_sniper::engine::selling_strategy::SellingEngine::new(
+        Arc::new(config.app_state.clone()),
+        Arc::new(config.swap_config.clone()),
+        selling_config,
+    );
+    selling_engine.log_selling_parameters();
+
+    // Initialize copy selling for existing token balances
+    match selling_engine.initialize_copy_selling_for_existing_tokens().await {
+        Ok(count) => {
+            if count > 0 {
+                println!("✅ Copy selling initialized for {} existing tokens", count);
+            }
+        },
+        Err(e) => {
+            eprintln!("⚠️  Failed to initialize copy selling for existing tokens: {}", e);
+        }
+    }
+
     // Get copy trading target addresses from environment
     let copy_trading_target_address = std::env::var("COPY_TRADING_TARGET_ADDRESS").ok();
     let is_multi_copy_trading = std::env::var("IS_MULTI_COPY_TRADING")
