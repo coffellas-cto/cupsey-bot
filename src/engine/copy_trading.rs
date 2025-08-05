@@ -2991,7 +2991,7 @@ async fn handle_parsed_data_for_selling(
                                 0.0
                             };
                             
-                            if let Some(whale_threshold) = selling_engine.config.dynamic_whale_selling.get_whale_threshold_for_pnl(pnl) {
+                                                         if let Some(whale_threshold) = selling_engine.get_config().dynamic_whale_selling.get_whale_threshold_for_pnl(pnl) {
                                 match selling_engine.whale_emergency_sell(&mint, &parsed_data, protocol.clone(), whale_threshold).await {
                                     Ok(_) => {
                                         logger.log(format!("🐋 Successfully executed whale emergency sell for token: {}", mint).green().bold().to_string());

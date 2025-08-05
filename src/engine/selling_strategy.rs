@@ -616,7 +616,7 @@ impl TokenManager {
                                                     0.0
                                                 };
                                                 
-                                                if let Some(whale_threshold) = engine_clone.config.dynamic_whale_selling.get_whale_threshold_for_pnl(pnl) {
+                                                if let Some(whale_threshold) = engine_clone.get_config().dynamic_whale_selling.get_whale_threshold_for_pnl(pnl) {
                                                     if let Err(e) = engine_clone.whale_emergency_sell(&token_mint_clone, &trade_info, SwapProtocol::PumpFun, whale_threshold).await {
                                                         let logger = Logger::new("[TOKEN-MANAGER-WHALE] => ".red().to_string());
                                                         logger.log(format!("Failed to whale emergency sell token {}: {}", token_mint_clone, e));
@@ -714,6 +714,11 @@ impl SellingEngine {
             logger: Logger::new("[SELLING-STRATEGY] => ".yellow().to_string()),
             token_manager: TokenManager::new(),
         }
+    }
+    
+    /// Get a reference to the selling configuration
+    pub fn get_config(&self) -> &SellingConfig {
+        &self.config
     }
     
     /// Log current selling strategy parameters
@@ -1897,7 +1902,7 @@ impl SellingEngine {
             },
             _ => {
                 self.logger.log("🐋 Unknown protocol, defaulting to PumpFun for whale emergency sell".yellow().to_string());
-                return self.whale_emergency_sell(token_mint, parsed_data, SwapProtocol::PumpFun, whale_threshold).await;
+                return Box::pin(self.whale_emergency_sell(token_mint, parsed_data, SwapProtocol::PumpFun, whale_threshold)).await;
             }
         };
 
