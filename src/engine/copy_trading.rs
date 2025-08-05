@@ -28,12 +28,8 @@ use crate::common::{
 };
 use crate::engine::swap::{SwapDirection, SwapProtocol};
 
+use tokio_util::sync::CancellationToken;
 use dashmap::DashMap;
-
-// DEX Program constants for monitoring
-pub const PUMP_FUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
-pub const PUMP_SWAP_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
-pub const RAYDIUM_LAUNCHPAD_PROGRAM: &str = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj";
 
 // Enum for different selling actions
 #[derive(Debug, Clone)]
@@ -223,6 +219,8 @@ lazy_static::lazy_static! {
     static ref LAST_BUY_TIME: Arc<DashMap<(), Option<Instant>>> = Arc::new(DashMap::new());
     static ref BUYING_ENABLED: Arc<DashMap<(), bool>> = Arc::new(DashMap::new());
     static ref TOKEN_TRACKING: Arc<DashMap<String, TokenTrackingInfo>> = Arc::new(DashMap::new());
+    // Global registry for monitoring task cancellation tokens
+    static ref MONITORING_TASKS: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
     // New: Bought token list for comprehensive tracking
     static ref BOUGHT_TOKEN_LIST: Arc<DashMap<String, BoughtTokenInfo>> = Arc::new(DashMap::new());
 }
@@ -274,7 +272,25 @@ async fn send_heartbeat_ping(
     }
 }
 
-
+/// Cancel monitoring task for a sold token and clean up tracking
+async fn cancel_token_monitoring(token_mint: &str, logger: &Logger) -> Result<(), String> {
+    logger.log(format!("Cancelling monitoring for sold token: {}", token_mint));
+    
+    // Cancel the monitoring task
+    if let Some(entry) = MONITORING_TASKS.remove(token_mint) {
+        entry.1.cancel();
+        logger.log(format!("Cancelled monitoring task for token: {}", token_mint));
+    } else {
+        logger.log(format!("No monitoring task found for token: {}", token_mint).yellow().to_string());
+    }
+    
+    // Remove from token tracking
+    if TOKEN_TRACKING.remove(token_mint).is_some() {
+        logger.log(format!("Removed token from tracking: {}", token_mint));
+    }
+    
+    Ok(())
+}
 
 /// Main function to start copy trading
 pub async fn start_copy_trading(config: CopyTradingConfig) -> Result<(), String> {
@@ -406,54 +422,25 @@ pub async fn start_copy_trading(config: CopyTradingConfig) -> Result<(), String>
     
     // Main stream processing loop
     logger.log("Starting main processing loop...".green().to_string());
-    let stream_result = loop {
-        match stream.next().await {
-            Some(msg_result) => {
-                match msg_result {
-                    Ok(msg) => {
-                        if let Err(e) = process_message(&msg, &subscribe_tx, config.clone(), &logger).await {
-                            logger.log(format!("Error processing message: {}", e).red().to_string());
-                        }
-                    },
-                    Err(e) => {
-                        logger.log(format!("Stream error: {:?}", e).red().to_string());
-                        break "stream_error";
-                    },
+    while let Some(msg_result) = stream.next().await {
+        match msg_result {
+            Ok(msg) => {
+                if let Err(e) = process_message(&msg, &subscribe_tx, config.clone(), &logger).await {
+                    logger.log(format!("Error processing message: {}", e).red().to_string());
                 }
             },
-            None => {
-                logger.log("Main stream ended".yellow().to_string());
-                break "stream_ended";
-            }
-        }
-    };
-    
-    // Properly close the main gRPC connection
-    logger.log(format!("Closing main copy trading gRPC connection (reason: {})", stream_result).yellow().to_string());
-    
-    // Drop the subscription sender to close the subscription
-    drop(subscribe_tx);
-    
-    // Drop the stream to close it
-    drop(stream);
-    
-    // The client will be automatically dropped when the function ends, 
-    // but we explicitly drop it here to ensure immediate cleanup
-    drop(client);
-    
-    logger.log("✅ Successfully closed main copy trading gRPC connection".green().to_string());
-    
-    // Return appropriate result
-    match stream_result {
-        "stream_error" => {
-            logger.log("Main stream ended due to error - connection properly closed, will attempt reconnect if needed".yellow().to_string());
-            Err("Main stream error".to_string())
-        },
-        _ => {
-            logger.log("Main stream ended normally - connection properly closed".yellow().to_string());
-            Ok(())
+            Err(e) => {
+                logger.log(format!("Stream error: {:?}", e).red().to_string());
+                // Try to reconnect
+                break;
+            },
         }
     }
+    
+    logger.log("Stream ended, attempting to reconnect...".yellow().to_string());
+    // Here you would implement reconnection logic
+    
+    Ok(())
 }
 
 /// Verify that a transaction was successful
@@ -1041,82 +1028,55 @@ async fn start_wallet_monitoring_internal(app_state: Arc<AppState>) -> Result<()
         .map_err(|e| format!("Failed to send wallet subscription: {}", e))?;
 
     // Process wallet transactions
-    let monitor_result = loop {
-        match stream.next().await {
-            Some(msg_result) => {
-                match msg_result {
-                    Ok(msg) => {
-                        if let Some(UpdateOneof::Transaction(txn)) = &msg.update_oneof {
-                            if let Some(transaction) = &txn.transaction {
-                                if let signature_bytes = &transaction.signature {
-                                    let signature = bs58::encode(signature_bytes).into_string();
+    while let Some(msg_result) = stream.next().await {
+        match msg_result {
+            Ok(msg) => {
+                if let Some(UpdateOneof::Transaction(txn)) = &msg.update_oneof {
+                    if let Some(transaction) = &txn.transaction {
+                        if let signature_bytes = &transaction.signature {
+                            let signature = bs58::encode(signature_bytes).into_string();
+                            
+                            if let Some(meta) = &transaction.meta {
+                                let is_buy = meta.log_messages.iter().any(|log| {
+                                    log.contains("Program log: Instruction: Buy") || log.contains("MintTo")
+                                });
+                                
+                                let is_sell = meta.log_messages.iter().any(|log| {
+                                    log.contains("Program log: Instruction: Sell")
+                                });
+                                
+                                if is_buy {
+                                    logger.log(format!("✅ WALLET BUY CONFIRMED: {}", signature).green().to_string());
+                                }
+                                
+                                if is_sell {
+                                    logger.log(format!("💰 WALLET SELL CONFIRMED: {}", signature).yellow().to_string());
                                     
-                                    if let Some(meta) = &transaction.meta {
-                                        let is_buy = meta.log_messages.iter().any(|log| {
-                                            log.contains("Program log: Instruction: Buy") || log.contains("MintTo")
-                                        });
-                                        
-                                        let is_sell = meta.log_messages.iter().any(|log| {
-                                            log.contains("Program log: Instruction: Sell")
-                                        });
-                                        
-                                        if is_buy {
-                                            logger.log(format!("✅ WALLET BUY CONFIRMED: {}", signature).green().to_string());
-                                        }
-                                        
-                                        if is_sell {
-                                            logger.log(format!("💰 WALLET SELL CONFIRMED: {}", signature).yellow().to_string());
-                                            
-                                            // Try to extract token mint and remove from bought list
-                                            for token_balance in &meta.post_token_balances {
-                                                if token_balance.ui_token_amount.as_ref().map(|ui| ui.ui_amount).unwrap_or(0.0) == 0.0 {
-                                                    // This token was sold completely
-                                                    BOUGHT_TOKEN_LIST.remove(&token_balance.mint);
-                                                    // Remove token from the global tracking system
-                                                    crate::engine::selling_strategy::TOKEN_METRICS.remove(&token_balance.mint);
-                                                    crate::engine::selling_strategy::TOKEN_TRACKING.remove(&token_balance.mint);
-                                                    logger.log(format!("Removed {} from tracking after confirmed sell", token_balance.mint));
-                                                }
-                                            }
+                                    // Try to extract token mint and remove from bought list
+                                    for token_balance in &meta.post_token_balances {
+                                        if token_balance.ui_token_amount.as_ref().map(|ui| ui.ui_amount).unwrap_or(0.0) == 0.0 {
+                                            // This token was sold completely
+                                            BOUGHT_TOKEN_LIST.remove(&token_balance.mint);
+                                            // Remove token from the global tracking system
+                                crate::engine::selling_strategy::TOKEN_METRICS.remove(&token_balance.mint);
+                                crate::engine::selling_strategy::TOKEN_TRACKING.remove(&token_balance.mint);
+                                            logger.log(format!("Removed {} from tracking after confirmed sell", token_balance.mint));
                                         }
                                     }
                                 }
                             }
                         }
-                    },
-                    Err(e) => {
-                        logger.log(format!("Wallet monitor stream error: {:?}", e).red().to_string());
-                        break "stream_error";
-                    },
+                    }
                 }
             },
-            None => {
-                logger.log("Wallet monitor stream ended".yellow().to_string());
-                break "stream_ended";
-            }
+            Err(e) => {
+                logger.log(format!("Wallet monitor stream error: {:?}", e).red().to_string());
+                return Err(format!("Wallet monitor stream error: {:?}", e));
+            },
         }
-    };
-    
-    // Properly close the gRPC connection
-    logger.log(format!("Closing wallet monitor gRPC connection (reason: {})", monitor_result).yellow().to_string());
-    
-    // Drop the subscription sender to close the subscription
-    drop(subscribe_tx);
-    
-    // Drop the stream to close it
-    drop(stream);
-    
-    // The client will be automatically dropped when the function ends, 
-    // but we explicitly drop it here to ensure immediate cleanup
-    drop(client);
-    
-    logger.log("✅ Successfully closed wallet monitor gRPC connection".green().to_string());
-    
-    // Return error if stream errored, otherwise Ok
-    match monitor_result {
-        "stream_error" => Err("Wallet monitor stream error".to_string()),
-        _ => Ok(())
     }
+    
+    Ok(())
 }
 
 
@@ -2512,7 +2472,9 @@ pub async fn execute_sell(
         logger.log(format!("Removed token account {} from global list after progressive sell", ata));
         
         // Cancel monitoring task for this token since it's been sold
-
+        if let Err(e) = cancel_token_monitoring(&token_mint, &logger).await {
+            logger.log(format!("Failed to cancel monitoring for token {}: {}", token_mint, e).yellow().to_string());
+        }
         
 
         
@@ -2898,6 +2860,10 @@ pub async fn execute_sell(
                 },
                 Err(e) => {
                     logger.log(format!("❌ Error during standard sell cleanup verification: {}", e).red().to_string());
+                    // Fallback to cancel monitoring
+                    if let Err(e) = cancel_token_monitoring(&token_mint, &logger).await {
+                        logger.log(format!("Failed to cancel monitoring for token {}: {}", token_mint, e).yellow().to_string());
+                    }
                 }
             }
             
@@ -2966,65 +2932,6 @@ async fn process_message(
     Ok(())  
 }
 
-/// Fallback sell evaluation when metrics are not available or failed to update
-fn evaluate_sell_conditions_fallback(
-    parsed_data: &transaction_parser::TradeInfoFromToken,
-    current_token_balance: f64,
-    logger: &Logger,
-) -> (bool, bool) {
-    // Basic fallback logic - sell if we have tokens and certain conditions are met
-    
-    // If we don't have any tokens, don't sell
-    if current_token_balance <= 0.0 {
-        return (false, false);
-    }
-    
-    // If this is a sell transaction from a large holder or creator, consider selling
-    if !parsed_data.is_buy {
-        // Check if this is a large sell (more than 20% of our holdings or large absolute amount)
-        let sell_amount = parsed_data.token_change.abs();
-        let is_large_sell = sell_amount > current_token_balance * 0.2 || sell_amount > 10000000.0; // 10M tokens
-        
-        if is_large_sell {
-            logger.log(format!("Large sell detected: {} tokens sold ({}% of our balance)", 
-                sell_amount, (sell_amount / current_token_balance) * 100.0).red().to_string());
-            return (true, true); // Emergency sell all
-        }
-    }
-    
-    // Check for creator sell (if coin_creator data is available)
-    if let Some(creator) = &parsed_data.coin_creator {
-        if !parsed_data.is_buy {
-            logger.log(format!("Creator sell detected from: {}", creator).red().to_string());
-            return (true, true); // Emergency sell all on creator sell
-        }
-    }
-    
-    // Check liquidity conditions - be more conservative
-    if parsed_data.liquidity > 0.0 {
-        let liquidity_sol = parsed_data.liquidity as f64 / 1e9; // Convert lamports to SOL
-        if liquidity_sol < 10.0 { // Less than 10 SOL liquidity (more conservative)
-            logger.log(format!("Very low liquidity detected: {:.2} SOL", liquidity_sol).red().to_string());
-            return (true, true); // Emergency sell on very low liquidity
-        } else if liquidity_sol < 25.0 { // Less than 25 SOL liquidity
-            logger.log(format!("Low liquidity detected: {:.2} SOL", liquidity_sol).yellow().to_string());
-            return (true, false); // Normal sell
-        }
-    }
-    
-    // Check for extreme price movements (if we have price data)
-    if parsed_data.price > 0 {
-        let price_sol = parsed_data.price as f64 / 1e9;
-        if price_sol < 0.00000001 { // Extremely low price
-            logger.log(format!("Extremely low price detected: {:.12} SOL", price_sol).red().to_string());
-            return (true, true); // Emergency sell
-        }
-    }
-    
-    // Default: don't sell
-    (false, false)
-}
-
 async fn handle_parsed_data_for_selling(
     parsed_data: transaction_parser::TradeInfoFromToken,
     config: Arc<CopyTradingConfig>,
@@ -3054,171 +2961,144 @@ async fn handle_parsed_data_for_selling(
         SellingConfig::set_from_env(), // SellingConfig::default(), 
     );
     
-    // Always try to update metrics first, but don't fail if it doesn't work
-    let metrics_updated = match selling_engine.update_metrics(&mint, &parsed_data).await {
-        Ok(_) => {
-            logger.log(format!("Successfully updated metrics for token: {}", mint).green().to_string());
-            true
-        },
-        Err(e) => {
-            logger.log(format!("Warning: Failed to update metrics for {}: {}", mint, e).yellow().to_string());
-            false
-        }
-    };
-    
-    // Check if we actually have tokens to sell first
-    let wallet_pubkey = match config.app_state.wallet.try_pubkey() {
-        Ok(pubkey) => pubkey,
-        Err(e) => {
-            logger.log(format!("Failed to get wallet pubkey: {}", e).red().to_string());
-            return Err(format!("Wallet error: {}", e));
-        }
-    };
-    
-    let token_pubkey = match Pubkey::from_str(&mint) {
-        Ok(pubkey) => pubkey,
-        Err(e) => {
-            logger.log(format!("Invalid token mint address {}: {}", mint, e).red().to_string());
-            return Err(format!("Invalid mint: {}", e));
-        }
-    };
-    
-    let ata = get_associated_token_address(&wallet_pubkey, &token_pubkey);
-    let current_token_balance = match config.app_state.rpc_nonblocking_client.get_token_account(&ata).await {
-        Ok(Some(account)) => {
-            let amount_value = account.token_amount.amount.parse::<f64>().unwrap_or(0.0);
-            amount_value / 10f64.powi(account.token_amount.decimals as i32)
-        },
-        Ok(None) => 0.0,
-        Err(_) => 0.0,
-    };
-    
-    logger.log(format!("Current token balance for {}: {}", mint, current_token_balance).blue().to_string());
-    
-    // If we don't have any tokens, no point in trying to sell
-    if current_token_balance <= 0.0 {
-        logger.log(format!("No tokens to sell for mint: {}", mint).yellow().to_string());
-        return Ok(());
+    // Update token metrics using the TradeInfoFromToken directly
+    if let Err(e) = selling_engine.update_metrics(&mint, &parsed_data).await {
+        logger.log(format!("Error updating metrics: {}", e).red().to_string());
+    } else {
+        logger.log(format!("Updated metrics for token: {}", mint).green().to_string());
     }
     
-    // Try to evaluate sell conditions with fallback logic
-    let (should_sell, sell_all) = if metrics_updated {
-        // Use normal evaluation if metrics were updated successfully
-        match selling_engine.evaluate_sell_conditions(&mint).await {
-            Ok(result) => {
-                logger.log(format!("Using enhanced selling strategy evaluation for {}", mint).green().to_string());
-                result
-            },
-            Err(e) => {
-                logger.log(format!("Error evaluating sell conditions: {}", e).red().to_string());
-                // Fallback to basic evaluation based on transaction data
-                logger.log("Falling back to basic sell evaluation".yellow().to_string());
-                evaluate_sell_conditions_fallback(&parsed_data, current_token_balance, logger)
-            }
-        }
-    } else {
-        // Use fallback evaluation if metrics update failed
-        logger.log("Using fallback sell evaluation due to metrics update failure".yellow().to_string());
-        evaluate_sell_conditions_fallback(&parsed_data, current_token_balance, logger)
-    };
-    
     // Check if we should sell this token
-    if should_sell {
-        logger.log(format!("Sell conditions met for token: {} (sell_all: {})", mint, sell_all).green().to_string());
-        
-        // Determine protocol to use for selling
-        let protocol = match instruction_type {
-            transaction_parser::DexType::PumpSwap => SwapProtocol::PumpSwap,
-            transaction_parser::DexType::PumpFun => SwapProtocol::PumpFun,
-            _ => config.protocol_preference.clone(),
-        };
-        
-        if sell_all {
-            // Emergency sell all tokens immediately to prevent further losses
-            logger.log(format!("EMERGENCY SELL ALL triggered for token: {}", mint).red().bold().to_string());
-            
-            // Try emergency sell first
-            let emergency_result = selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await;
-            match emergency_result {
-                Ok(_) => {
-                    logger.log(format!("Successfully executed emergency sell all for token: {}", mint).green().to_string());
-                },
-                Err(e) => {
-                    logger.log(format!("Error executing emergency sell all: {}", e).red().to_string());
-                    // Try fallback to normal execute_sell
-                    logger.log("Attempting fallback to normal sell execution".yellow().to_string());
-                    match execute_sell(
-                        mint.clone(),
-                        parsed_data.clone(),
-                        config.app_state.clone().into(),
-                        Arc::new(config.swap_config.clone()),
-                        protocol.clone(),
-                        None,   // Default chunks
-                        None,   // Default interval
-                    ).await {
-                        Ok(_) => {
-                            logger.log("Fallback sell execution succeeded".green().to_string());
-                        },
-                        Err(fallback_err) => {
-                            logger.log(format!("Fallback sell also failed: {}", fallback_err).red().to_string());
-                            return Err(format!("Both emergency and fallback sells failed: {} / {}", e, fallback_err));
-                        }
-                    }
-                }
-            }
-        } else {
-            // Normal selling logic - try emergency sell all first, then fallback to standard sell
-            logger.log(format!("Normal sell triggered for token: {}", mint).blue().to_string());
-            
-            // Try emergency sell first for normal sells too
-            match selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await {
-                Ok(_) => {
-                    logger.log(format!("Emergency sell completed for token: {}", mint).green().to_string());
-                },
-                Err(e) => {
-                    logger.log(format!("Emergency sell failed, trying standard sell: {}", e).yellow().to_string());
+    match selling_engine.evaluate_sell_conditions(&mint).await {
+        Ok((should_sell, sell_all)) => {
+            if should_sell {
+                logger.log(format!("Sell conditions met for token: {}", mint).green().to_string());
+                
+                // Determine protocol to use for selling
+                let protocol = match instruction_type {
+                    transaction_parser::DexType::PumpSwap => SwapProtocol::PumpSwap,
+                    transaction_parser::DexType::PumpFun => SwapProtocol::PumpFun,
+                    _ => config.protocol_preference.clone(),
+                };
+                
+                if sell_all {
+                    // Emergency sell all tokens immediately to prevent further losses
+                    logger.log(format!("EMERGENCY SELL ALL triggered for token: {}", mint).red().bold().to_string());
                     
-                    // Fallback to standard sell
-                    match execute_sell(
-                        mint.clone(),
-                        parsed_data.clone(),
-                        config.app_state.clone().into(),
-                        Arc::new(config.swap_config.clone()),
-                        protocol.clone(),
-                        None,   // Default chunks
-                        None,   // Default interval
-                    ).await {
+                    match selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await {
                         Ok(_) => {
-                            logger.log(format!("Standard sell completed for token: {}", mint).green().to_string());
+                            logger.log(format!("Successfully executed emergency sell all for token: {}", mint).green().to_string());
+                            // Cancel monitoring task for this token since it's been sold
+                            if let Err(e) = cancel_token_monitoring(&mint, &logger).await {
+                                logger.log(format!("Failed to cancel monitoring for token {}: {}", mint, e).yellow().to_string());
+                            }
+
                         },
-                        Err(sell_err) => {
-                            logger.log(format!("Error executing standard sell: {}", sell_err).red().to_string());
-                            return Err(format!("Both emergency and standard sell failed: {} / {}", e, sell_err));
+                        Err(e) => {
+                            logger.log(format!("Error executing emergency sell all: {}", e).red().to_string());
+                            
+
+                            
+                            return Err(format!("Failed to execute emergency sell all: {}", e));
                         }
                     }
+                } else {
+                    // Normal selling logic - try emergency sell all first, then fallback to standard sell
+                    println!("emergency sell all : token creator: {:?}", parsed_data.coin_creator);
+                    if let Err(e) = selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await {
+                        logger.log(format!("Error executing emergency sell all: {}", e).red().to_string());
+                        
+                        // TODO: This logic might need to be updated later. If emergency sell all fails, try standard sell
+                        // logger.log("Attempting standard sell as fallback".yellow().to_string());
+                        // if let Err(e) = execute_sell(
+                        //     mint.clone(),
+                        //     parsed_data.clone(),
+                        //     config.app_state.clone().into(),
+                        //     Arc::new(config.swap_config.clone()),
+                        //     protocol.clone(),
+                        //     false,  // Not progressive
+                        //     None,   // Default chunks
+                        //     None,   // Default interval
+                        // ).await {
+                        //     logger.log(format!("Error executing standard sell: {}", e).red().to_string());
+                        //     return Err(format!("Failed to sell token: {}", e));
+                        // } else {
+                        //     // Standard sell succeeded, cancel monitoring
+                        //     if let Err(e) = cancel_token_monitoring(&mint, &logger).await {
+                        //         logger.log(format!("Failed to cancel monitoring for token {}: {}", mint, e).yellow().to_string());
+                        //     }
+                        // }
+                    } else {
+                        // Progressive sell succeeded, cancel monitoring
+                        if let Err(e) = cancel_token_monitoring(&mint, &logger).await {
+                            logger.log(format!("Failed to cancel monitoring for token {}: {}", mint, e).yellow().to_string());
+                        }
+                    }
+                    
+
                 }
+                
+                logger.log(format!("Successfully processed sell for token: {}", mint).green().to_string());
+            } else {
+                logger.log(format!("Not selling token yet: {}", mint).blue().to_string());
             }
+        },
+        Err(e) => {
+            logger.log(format!("Error evaluating sell conditions: {}", e).red().to_string());
         }
-        
-        logger.log(format!("Successfully processed sell for token: {}", mint).green().to_string());
-    } else {
-        logger.log(format!("No sell conditions met for token: {}", mint).blue().to_string());
     }
     
     logger.log(format!("Processing time for sell transaction: {:?}", start_time.elapsed()).blue().to_string());
     Ok(())
 }
 
-
-
-
-
-/// Monitor tokens for selling opportunities
-pub async fn monitor_token_for_selling(
-    dex_ids: Vec<String>,
+/// Set up selling strategy for a token
+async fn setup_selling_strategy(
+    token_mint: String,
     app_state: Arc<AppState>,
     swap_config: Arc<SwapConfig>,
+    protocol_preference: SwapProtocol,
+) -> Result<(), String> {
+    let logger = Logger::new("[SETUP-SELLING-STRATEGY] => ".green().to_string());
+    
+    // Initialize
+    logger.log(format!("Setting up selling strategy for token: {}", token_mint));
+    
+    // Create cancellation token for this monitoring task
+    let cancellation_token = CancellationToken::new();
+    
+    // Register the cancellation token
+    MONITORING_TASKS.insert(token_mint.clone(), cancellation_token.clone());
+    
+    // Clone values that will be moved into the task
+    let token_mint_cloned = token_mint.clone();
+    let app_state_cloned = app_state.clone();
+    let swap_config_cloned = swap_config.clone();
+    let protocol_preference_cloned = protocol_preference.clone();
+    let logger_cloned = logger.clone();
+    
+    // Spawn a task to handle the monitoring and selling
+    tokio::spawn(async move {
+        let _ = monitor_token_for_selling(
+            token_mint_cloned, 
+            app_state_cloned, 
+            swap_config_cloned, 
+            protocol_preference_cloned, 
+            &logger_cloned,
+            cancellation_token
+        ).await;
+    });
+    Ok(())
+}
+
+/// Monitor a token specifically for selling opportunities
+async fn monitor_token_for_selling(
+    token_mint: String,
+    app_state: Arc<AppState>,
+    swap_config: Arc<SwapConfig>,
+    protocol_preference: SwapProtocol,
     logger: &Logger,
+    cancellation_token: CancellationToken,
 ) -> Result<(), String> {
     // Create config for the Yellowstone connection
     // This is a simplified version of what's in the main copy_trading function
@@ -3226,18 +3106,15 @@ pub async fn monitor_token_for_selling(
     let mut yellowstone_grpc_token = "your_token_here".to_string(); // Default value
     
     // Try to get config values from environment if available
-    if let Ok(url) = std::env::var("GRPC_ENDPOINT") {
+    if let Ok(url) = std::env::var("YELLOWSTONE_GRPC_HTTP") {
         yellowstone_grpc_http = url;
     }
     
-    if let Ok(token) = std::env::var("GRPC_X_TOKEN") {
+    if let Ok(token) = std::env::var("YELLOWSTONE_GRPC_TOKEN") {
         yellowstone_grpc_token = token;
     }
     
-    logger.log("Connecting to Yellowstone gRPC for selling monitoring...".green().to_string());
-    
-
-    println!("DEX IDs for selling monitor: {:?}", dex_ids);
+    logger.log("Connecting to Yellowstone gRPC for selling, will close connection after selling ...".green().to_string());
     
     // Connect to Yellowstone gRPC
     let mut client = GeyserGrpcClient::build_from_shared(yellowstone_grpc_http.clone())
@@ -3272,14 +3149,14 @@ pub async fn monitor_token_for_selling(
 
     // Convert to Arc to allow cloning across tasks
     let subscribe_tx = Arc::new(tokio::sync::Mutex::new(subscribe_tx));
-    // Set up subscription focused on the DEX programs
+    // Set up subscription focused on the token mint
     let subscription_request = SubscribeRequest {
         transactions: maplit::hashmap! {
             "TokenMonitor".to_owned() => SubscribeRequestFilterTransactions {
                 vote: Some(false), // Exclude vote transactions
                 failed: Some(false), // Exclude failed transactions
                 signature: None,
-                account_include: dex_ids.clone(), // Only include transactions involving our DEX programs
+                account_include: vec![token_mint.clone()], // Only include transactions involving our token
                 account_exclude: vec![JUPITER_PROGRAM.to_string(), OKX_DEX_PROGRAM.to_string()], // Exclude some common programs
                 account_required: Vec::<String>::new(),
             }
@@ -3303,9 +3180,9 @@ pub async fn monitor_token_for_selling(
         app_state: (*app_state).clone(),
         swap_config: (*swap_config).clone(),
         counter_limit: 5,
-        target_addresses: vec![], // Not needed for selling monitoring
+        target_addresses: vec![token_mint.clone()],
         excluded_addresses: vec![JUPITER_PROGRAM.to_string(), OKX_DEX_PROGRAM.to_string()],
-        protocol_preference: SwapProtocol::Auto, // Default value for selling monitoring
+        protocol_preference,
     };
 
     let config = Arc::new(copy_trading_config);
@@ -3330,30 +3207,32 @@ pub async fn monitor_token_for_selling(
     
     // Main stream processing loop
     logger.log("Starting main processing loop with timer-based selling checks...".green().to_string());
-    let monitoring_result = loop {
+    loop {
         tokio::select! {
+            // Check for cancellation
+            _ = cancellation_token.cancelled() => {
+                logger.log(format!("Monitoring cancelled for token: {}", token_mint).yellow().to_string());
+                break;
+            }
             // Timer-based selling checks
             _ = selling_timer.tick() => {
-                // Check all bought tokens and update their prices/sell conditions
-                let tokens_to_check: Vec<String> = BOUGHT_TOKEN_LIST.iter().map(|item| item.key().clone()).collect();
-                
-                if tokens_to_check.is_empty() {
-                    // No tokens to monitor, continue
-                    continue;
-                }
-                
-                for token_mint in tokens_to_check {
-                    if BOUGHT_TOKEN_LIST.contains_key(&token_mint) {
-                        // Update token price first
-                        if let Err(e) = update_token_price(&token_mint, &app_state).await {
-                            logger.log(format!("Failed to update price for {}: {}", token_mint, e).yellow().to_string());
-                        }
-                        
-                        // Execute threshold-based progressive selling (copy_trading.rs system)
-                        if let Err(e) = execute_enhanced_sell(token_mint.clone(), app_state.clone(), swap_config.clone()).await {
-                            logger.log(format!("Timer-based threshold selling check error for {}: {}", token_mint, e).yellow().to_string());
-                        }
+                // Check if token still exists in tracking
+                if BOUGHT_TOKEN_LIST.contains_key(&token_mint) {
+                    // Update token price first
+                    if let Err(e) = update_token_price(&token_mint, &app_state).await {
+                        logger.log(format!("Failed to update price for {}: {}", token_mint, e).yellow().to_string());
                     }
+                    
+                    // Execute threshold-based progressive selling (copy_trading.rs system)
+                    if let Err(e) = execute_enhanced_sell(token_mint.clone(), app_state.clone(), swap_config.clone()).await {
+                        logger.log(format!("Timer-based threshold selling check error for {}: {}", token_mint, e).yellow().to_string());
+                    }
+                    
+
+                } else {
+                    // Token no longer tracked, exit monitoring
+                    logger.log(format!("Token {} no longer tracked, ending monitoring", token_mint).green().to_string());
+                    break;
                 }
             }
             // Process stream messages
@@ -3366,19 +3245,19 @@ pub async fn monitor_token_for_selling(
                     },
                     Some(Err(e)) => {
                         logger.log(format!("Stream error: {:?}", e).red().to_string());
-                        break "stream_error";
+                        // Try to reconnect
+                        break;
                     },
                     None => {
                         logger.log("Stream ended".yellow().to_string());
-                        break "stream_ended";
+                        break;
                     }
                 }
             }
         }
-    };
+    }
     
-    // Keep the gRPC connection alive - don't close it
-    logger.log(format!("Selling monitoring task ended (reason: {}) - keeping gRPC connection alive", monitoring_result).yellow().to_string());
+    logger.log(format!("Monitoring task ended for token: {}", token_mint).yellow().to_string());
     
     Ok(())
 }
@@ -3478,6 +3357,11 @@ async fn handle_parsed_data_for_buying(
                 match result {
                     Ok(_) => {
                         logger.log(format!("✅ Successfully executed whale emergency sell for token: {}", parsed_data.mint).green().to_string());
+                        
+                        // Cancel monitoring for this token since it's been sold
+                        if let Err(e) = cancel_token_monitoring(&parsed_data.mint, &logger).await {
+                            logger.log(format!("Failed to cancel monitoring for token {}: {}", parsed_data.mint, e).yellow().to_string());
+                        }
                     },
                     Err(e) => {
                         logger.log(format!("❌ Failed to execute whale emergency sell for token {}: {}", parsed_data.mint, e).red().to_string());
@@ -3570,13 +3454,27 @@ async fn handle_parsed_data_for_buying(
                 logger.log(format!("copied transaction {}", target_signature.clone().unwrap_or_default()).blue().to_string());
                 logger.log(format!("Now starting to monitor this token to sell at a profit").blue().to_string());
                 
-                // Wait for buy transaction to be confirmed and processed
+                // Wait for buy transaction to be confirmed and processed before starting selling monitor
+                // This prevents race condition where selling monitor starts before entry_price is set
                 logger.log("Waiting 2 seconds for buy transaction to be fully processed...".yellow().to_string());
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 
-                // Token will be monitored by the separate selling monitor running in parallel
-                logger.log("Token added to BOUGHT_TOKEN_LIST for monitoring by selling strategy".green().to_string());
-                Ok(())
+                // Setup selling strategy based on take profit and stop loss
+                match setup_selling_strategy(
+                    parsed_data.mint.clone(), 
+                    config.app_state.clone().into(), 
+                    Arc::new(config.swap_config.clone()), 
+                    protocol.clone(),
+                ).await {
+                    Ok(_) => {
+                        logger.log("Selling strategy set up successfully".green().to_string());
+                        Ok(())
+                    },
+                    Err(e) => {
+                        logger.log(format!("Failed to set up selling strategy: {}", e).red().to_string());
+                        Err(e)
+                    }
+                }
             }
         }
     } else {
@@ -3682,7 +3580,11 @@ async fn verify_sell_transaction_and_cleanup(
             removed_systems.push("TOKEN_METRICS");
         }
         
-        // Note: Monitoring tasks are now handled by the global selling monitor
+        // Cancel monitoring task
+        if let Some(entry) = MONITORING_TASKS.remove(token_mint) {
+            entry.1.cancel();
+            removed_systems.push("MONITORING_TASKS");
+        }
         
         // Remove from wallet token accounts
         if let Ok(wallet_pubkey) = app_state.wallet.try_pubkey() {

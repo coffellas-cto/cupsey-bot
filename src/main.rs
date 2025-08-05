@@ -13,7 +13,7 @@ use anchor_client::solana_sdk::signature::Signer;
 use solana_vntr_sniper::{
     common::{config::Config, constants::RUN_MSG, cache::WALLET_TOKEN_ACCOUNTS},
     engine::{
-        copy_trading::{start_copy_trading, CopyTradingConfig, monitor_token_for_selling, PUMP_FUN_PROGRAM, PUMP_SWAP_PROGRAM, RAYDIUM_LAUNCHPAD_PROGRAM},
+        copy_trading::{start_copy_trading, CopyTradingConfig},
         swap::SwapProtocol,
     },
     services::{ cache_maintenance, blockhash_processor::BlockhashProcessor},
@@ -28,7 +28,6 @@ use colored::Colorize;
 use spl_token::instruction::sync_native;
 use spl_token::ui_amount_to_amount;
 use spl_associated_token_account::get_associated_token_address;
-use std::sync::Arc;
 
 /// Initialize the wallet token account list by fetching all token accounts owned by the wallet
 async fn initialize_token_account_list(config: &Config) {
@@ -370,41 +369,7 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
         // Check for command line arguments
-        if args.contains(&"--test".to_string()) {
-            println!("🧪 Running selling monitor test mode...");
-            
-            // Create DEX IDs for the selling monitor
-            let dex_ids = vec![
-                PUMP_FUN_PROGRAM.to_string(),
-                PUMP_SWAP_PROGRAM.to_string(),
-                RAYDIUM_LAUNCHPAD_PROGRAM.to_string(),
-            ];
-            
-            // Create logger for selling monitor
-            let selling_logger = solana_vntr_sniper::common::logger::Logger::new("[SELLING-TEST] => ".cyan().bold().to_string());
-            
-            // Clone necessary values for the selling monitor task
-            let selling_app_state = config.app_state.clone();
-            let selling_swap_config = Arc::new(config.swap_config.clone());
-            
-            selling_logger.log("Starting selling monitor in test mode...".green().to_string());
-            
-            // Run only the selling monitor
-            match monitor_token_for_selling(
-                dex_ids,
-                selling_app_state.into(),
-                selling_swap_config,
-                &selling_logger,
-            ).await {
-                Ok(_) => {
-                    println!("✅ Selling monitor test completed successfully");
-                },
-                Err(e) => {
-                    eprintln!("❌ Selling monitor test failed: {}", e);
-                }
-            }
-            return;
-        } else if args.contains(&"--wrap".to_string()) {
+        if args.contains(&"--wrap".to_string()) {
             println!("Wrapping SOL to WSOL...");
             
             // Get wrap amount from .env
@@ -526,53 +491,13 @@ async fn main() {
         app_state: config.app_state.clone(),
         swap_config: config.swap_config.clone(),
         counter_limit: config.counter_limit as u64,
-        target_addresses, 
+        target_addresses,
         excluded_addresses,
         protocol_preference,
     };
     
-    // Create DEX IDs for the selling monitor
-    let dex_ids = vec![
-        PUMP_FUN_PROGRAM.to_string(),
-        PUMP_SWAP_PROGRAM.to_string(),
-        RAYDIUM_LAUNCHPAD_PROGRAM.to_string(),
-    ];
-    
-    // Create logger for selling monitor
-    let selling_logger = solana_vntr_sniper::common::logger::Logger::new("[SELLING-MONITOR] => ".cyan().bold().to_string());
-    
-    // Clone necessary values for the selling monitor task
-    let selling_app_state = config.app_state.clone();
-    let selling_swap_config = Arc::new(config.swap_config.clone());
-    
-    // Start both GRPC subscriptions simultaneously
-    let copy_trading_task = tokio::spawn(async move {
-        if let Err(e) = start_copy_trading(copy_trading_config).await {
-            eprintln!("Copy trading error: {}", e);
-        }
-    });
-    
-    let selling_monitor_task = tokio::spawn(async move {
-        if let Err(e) = monitor_token_for_selling(
-            dex_ids,
-            selling_app_state.into(),
-            selling_swap_config,
-            &selling_logger,
-        ).await {
-            eprintln!("Selling monitor error: {}", e);
-        }
-    });
-    
-    println!("✅ Started both copy trading and selling monitor");
-    
-    // Wait for both tasks to complete
-    let (copy_result, selling_result) = tokio::join!(copy_trading_task, selling_monitor_task);
-    
-    if let Err(e) = copy_result {
-        eprintln!("Copy trading task error: {}", e);
-    }
-    
-    if let Err(e) = selling_result {
-        eprintln!("Selling monitor task error: {}", e);
+    // Start the copy trading bot
+    if let Err(e) = start_copy_trading(copy_trading_config).await {
+        eprintln!("Copy trading error: {}", e);
     }
 }
