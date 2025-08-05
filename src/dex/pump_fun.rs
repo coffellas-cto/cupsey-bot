@@ -214,6 +214,10 @@ impl Pump {
         let bonding_curve = get_pda(&Pubkey::from_str(mint_str)?, &pump_program)?;
         let associated_bonding_curve = get_associated_token_address(&bonding_curve, &Pubkey::from_str(mint_str)?);
 
+        // Get volume accumulator PDAs
+        let global_volume_accumulator = get_global_volume_accumulator_pda(&pump_program)?;
+        let user_volume_accumulator = get_user_volume_accumulator_pda(&owner, &pump_program)?;
+
         // Determine if this is a buy or sell operation
         let (token_in, token_out, pump_method) = match swap_config.swap_direction {
             SwapDirection::Buy => (native_mint, Pubkey::from_str(mint_str)?, PUMP_BUY_METHOD),
@@ -312,6 +316,8 @@ impl Pump {
                         AccountMeta::new(creator_vault, false),
                         AccountMeta::new_readonly(Pubkey::from_str(PUMP_EVENT_AUTHORITY)?, false),
                         AccountMeta::new_readonly(pump_program, false),
+                        AccountMeta::new(global_volume_accumulator, false),
+                        AccountMeta::new(user_volume_accumulator, false),
                     ]
                 )
             },
@@ -382,6 +388,8 @@ impl Pump {
                         AccountMeta::new_readonly(token_program_id, false),
                         AccountMeta::new_readonly(Pubkey::from_str(PUMP_EVENT_AUTHORITY)?, false),
                         AccountMeta::new_readonly(pump_program, false),
+                        AccountMeta::new(global_volume_accumulator, false),
+                        AccountMeta::new(user_volume_accumulator, false),
                     ]
                 )
             }
