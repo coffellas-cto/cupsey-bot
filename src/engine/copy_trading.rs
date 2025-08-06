@@ -27,6 +27,7 @@ use crate::common::{
     cache::WALLET_TOKEN_ACCOUNTS,
 };
 use crate::engine::swap::{SwapDirection, SwapProtocol};
+use crate::engine::circuit_breaker::{TransactionCircuitBreaker, verify_transaction_optimized, RpcConnectionPool, ParallelDexBuilder};
 
 use tokio_util::sync::CancellationToken;
 use dashmap::DashMap;
@@ -224,6 +225,10 @@ lazy_static::lazy_static! {
     static ref PROCESSED_SIGNATURES: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
     // Add: Active buy operations to prevent concurrent buys for same token
     static ref ACTIVE_BUY_OPERATIONS: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
+    // Add: Transaction circuit breaker for optimized verification
+    static ref TRANSACTION_CIRCUIT_BREAKER: TransactionCircuitBreaker = TransactionCircuitBreaker::new(5, Duration::from_secs(30));
+    // Add: Parallel DEX builder for improved instruction building
+    static ref PARALLEL_DEX_BUILDER: ParallelDexBuilder = ParallelDexBuilder::new();
 }
 
 // Initialize the global counters with default values
@@ -695,8 +700,8 @@ pub async fn execute_buy(
                             logger.log(format!("Buy transaction sent: {}", signature));
                             
                             
-                            // Verify transaction
-                            match verify_transaction(&signature.to_string(), app_state.clone(), &logger).await {
+                            // Verify transaction using optimized circuit breaker
+                            match verify_transaction_optimized(&signature.to_string(), app_state.clone(), &TRANSACTION_CIRCUIT_BREAKER, &logger).await {
                                 Ok(verified) => {
                                     if verified {
                                         logger.log("Buy transaction verified successfully".to_string());
@@ -795,8 +800,8 @@ pub async fn execute_buy(
                             let signature = &signatures[0];
                             logger.log(format!("Buy transaction sent: {}", signature));
                             
-                            // Verify transaction
-                            match verify_transaction(&signature.to_string(), app_state.clone(), &logger).await {
+                            // Verify transaction using optimized circuit breaker
+                            match verify_transaction_optimized(&signature.to_string(), app_state.clone(), &TRANSACTION_CIRCUIT_BREAKER, &logger).await {
                                 Ok(verified) => {
                                     if verified {
                                         logger.log("Buy transaction verified successfully".to_string());
@@ -890,8 +895,8 @@ pub async fn execute_buy(
                             let signature = &signatures[0];
                             logger.log(format!("Buy transaction sent: {}", signature));
                             
-                            // Verify transaction
-                            match verify_transaction(&signature.to_string(), app_state.clone(), &logger).await {
+                            // Verify transaction using optimized circuit breaker
+                            match verify_transaction_optimized(&signature.to_string(), app_state.clone(), &TRANSACTION_CIRCUIT_BREAKER, &logger).await {
                                 Ok(verified) => {
                                     if verified {
                                         logger.log("Buy transaction verified successfully".to_string());
@@ -987,8 +992,8 @@ pub async fn execute_buy(
                             let signature = &signatures[0];
                             logger.log(format!("Buy transaction sent: {}", signature));
                             
-                            // Verify transaction
-                            match verify_transaction(&signature.to_string(), app_state.clone(), &logger).await {
+                            // Verify transaction using optimized circuit breaker
+                            match verify_transaction_optimized(&signature.to_string(), app_state.clone(), &TRANSACTION_CIRCUIT_BREAKER, &logger).await {
                                 Ok(verified) => {
                                     if verified {
                                         logger.log("Buy transaction verified successfully".to_string());
@@ -2347,8 +2352,8 @@ pub async fn execute_sell(
                                     let signature = &signatures[0];
                                     logger.log(format!("Sell transaction sent: {}", signature));
                                     
-                                    // Verify transaction
-                                    match verify_transaction(&signature.to_string(), app_state.clone(), &logger).await {
+                                    // Verify transaction using optimized circuit breaker
+                                    match verify_transaction_optimized(&signature.to_string(), app_state.clone(), &TRANSACTION_CIRCUIT_BREAKER, &logger).await {
                                         Ok(verified) => {
                                             if verified {
                                                 logger.log("Sell transaction verified successfully".to_string());
