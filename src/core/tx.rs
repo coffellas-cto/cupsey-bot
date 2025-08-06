@@ -107,9 +107,10 @@ pub async fn new_signed_and_send_zeroslot(
                     .to_string(),
             );
         }
-        Err(_) => {
-            // Convert the error to a Send-compatible form
-            return Err(anyhow::anyhow!("zeroslot send_transaction failed"));
+        Err(e) => {
+            // Provide detailed error information for debugging
+            logger.log(format!("Zeroslot transaction failed: {:?}", e).red().to_string());
+            return Err(anyhow::anyhow!("zeroslot send_transaction failed: {:?}", e));
         }
     };
 

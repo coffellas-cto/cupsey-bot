@@ -607,17 +607,7 @@ pub async fn execute_buy(
                                             WALLET_TOKEN_ACCOUNTS.insert(token_ata);
                                             logger.log(format!("Added token account {} to global list", token_ata));
                                             
-                                            // Add to enhanced tracking system for PumpFun
-                                            let bought_token_info = BoughtTokenInfo::new(
-                                                trade_info.mint.clone(),
-                                                trade_info.price, // Use price directly from TradeInfoFromToken (already scaled)
-                                                amount_in,
-                                                _token_amount,
-                                                protocol.clone(),
-                                                trade_info.clone(),
-                                                3, // 3 seconds selling time
-                                            );
-                                            BOUGHT_TOKEN_LIST.insert(trade_info.mint.clone(), bought_token_info);
+                                                                        // Enhanced tracking will be handled at the end of execute_buy function to avoid duplicates
                                             logger.log(format!("Added {} to enhanced tracking system (PumpFun)", trade_info.mint));
                                             
                                             // Add to permanent blacklist (never rebuy this token)
@@ -707,26 +697,7 @@ pub async fn execute_buy(
                                             WALLET_TOKEN_ACCOUNTS.insert(token_ata);
                                             logger.log(format!("Added token account {} to global list", token_ata));
                                             
-                                            // Add to enhanced tracking system for PumpSwap
-                                            let bought_token_info = BoughtTokenInfo::new(
-                                                trade_info.mint.clone(),
-                                                trade_info.price, // Use price directly from TradeInfoFromToken (already scaled)
-                                                amount_in,
-                                                _token_amount,
-                                                protocol.clone(),
-                                                trade_info.clone(),
-                                                3, // 3 seconds selling time
-                                            );
-                                            BOUGHT_TOKEN_LIST.insert(trade_info.mint.clone(), bought_token_info);
-                                            logger.log(format!("Added {} to enhanced tracking system (PumpSwap)", trade_info.mint));
-                                            
-                                            // Add to permanent blacklist (never rebuy this token)
-                                            let timestamp = std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_secs();
-                                            BOUGHT_TOKENS_BLACKLIST.insert(trade_info.mint.clone(), timestamp);
-                                            logger.log(format!("🚫 Added {} to permanent blacklist", trade_info.mint));
+                                            // Enhanced tracking will be handled at the end of execute_buy function to avoid duplicates
                                         }
                                         
                                         Ok(())
@@ -802,26 +773,7 @@ pub async fn execute_buy(
                                             WALLET_TOKEN_ACCOUNTS.insert(token_ata);
                                             logger.log(format!("Added token account {} to global list", token_ata));
                                             
-                                            // Add to enhanced tracking system for Raydium
-                                            let bought_token_info = BoughtTokenInfo::new(
-                                                trade_info.mint.clone(),
-                                                trade_info.price, // Use price directly from TradeInfoFromToken (already scaled)
-                                                amount_in,
-                                                _token_amount,
-                                                protocol.clone(),
-                                                trade_info.clone(),
-                                                3, // 3 seconds selling time
-                                            );
-                                            BOUGHT_TOKEN_LIST.insert(trade_info.mint.clone(), bought_token_info);
-                                            logger.log(format!("Added {} to enhanced tracking system (Raydium)", trade_info.mint));
-                                            
-                                            // Add to permanent blacklist (never rebuy this token)
-                                            let timestamp = std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_secs();
-                                            BOUGHT_TOKENS_BLACKLIST.insert(trade_info.mint.clone(), timestamp);
-                                            logger.log(format!("🚫 Added {} to permanent blacklist", trade_info.mint));
+                                            // Enhanced tracking will be handled at the end of execute_buy function to avoid duplicates
                                         }
                                         
                                         Ok(())
@@ -899,28 +851,7 @@ pub async fn execute_buy(
                                             WALLET_TOKEN_ACCOUNTS.insert(token_ata);
                                             logger.log(format!("Added token account {} to global list", token_ata));
                                             
-                                            // Add to enhanced tracking system for PumpFun
-                                            let bought_token_info = BoughtTokenInfo::new(
-                                                trade_info.mint.clone(),
-                                                trade_info.price, // Use price directly from TradeInfoFromToken (already scaled)
-                                                amount_in,
-                                                _token_amount,
-                                                SwapProtocol::PumpFun, // Use PumpFun as the fallback protocol
-                                                trade_info.clone(),
-                                                import_env_var("SELLING_TIME").parse::<u64>().unwrap_or(600),
-                                            );
-                                            
-                                            // Insert the token into the bought tokens map for monitoring
-                                            BOUGHT_TOKEN_LIST.insert(trade_info.mint.clone(), bought_token_info);
-                                            logger.log(format!("Added {} to bought tokens tracking", trade_info.mint));
-                                            
-                                            // Add to permanent blacklist (never rebuy this token)
-                                            let timestamp = std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_secs();
-                                            BOUGHT_TOKENS_BLACKLIST.insert(trade_info.mint.clone(), timestamp);
-                                            logger.log(format!("🚫 Added {} to permanent blacklist", trade_info.mint));
+                                                                        // Enhanced tracking will be handled at the end of execute_buy function to avoid duplicates
                                             
                                             // Start enhanced selling monitor for this token
                                             let app_state_clone = app_state.clone();
@@ -1197,10 +1128,21 @@ async fn execute_pumpfun_emergency_sell_with_zeroslot(
         Ok((keypair, instructions, price)) => {
             logger.log(format!("🐋 Generated PumpFun whale emergency sell instruction at price: {}", price));
             
+            // For emergency sells, we need the freshest possible blockhash to ensure transaction lands
             let recent_blockhash = match crate::services::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
-                Some(hash) => hash,
+                Some(hash) => {
+                    logger.log("🐋 Using cached blockhash for emergency sell".cyan().to_string());
+                    hash
+                },
                 None => {
-                    return Err("Failed to get recent blockhash".to_string());
+                    logger.log("🐋 Cached blockhash stale, fetching fresh blockhash directly from RPC".yellow().to_string());
+                    match app_state.rpc_client.get_latest_blockhash() {
+                        Ok(hash) => hash,
+                        Err(e) => {
+                            logger.log(format!("🐋 Failed to get fresh blockhash from RPC: {}", e).red().to_string());
+                            return Err(format!("Failed to get recent blockhash: {}", e));
+                        }
+                    }
                 }
             };
             
@@ -3497,10 +3439,7 @@ async fn handle_parsed_data_for_buying(
                 logger.log(format!("copied transaction {}", target_signature.clone().unwrap_or_default()).blue().to_string());
                 logger.log(format!("Now starting to monitor this token to sell at a profit").blue().to_string());
                 
-                // Wait for buy transaction to be confirmed and processed before starting selling monitor
-                // This prevents race condition where selling monitor starts before entry_price is set
-                logger.log("Waiting 2 seconds for buy transaction to be fully processed...".yellow().to_string());
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                // Removed 2-second wait to reduce latency - tracking is now handled synchronously
                 
                 // Setup selling strategy based on take profit and stop loss
                 match setup_selling_strategy(

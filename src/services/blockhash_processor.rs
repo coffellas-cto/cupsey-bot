@@ -14,8 +14,8 @@ lazy_static! {
     static ref BLOCKHASH_LAST_UPDATED: Arc<RwLock<Option<Instant>>> = Arc::new(RwLock::new(None));
 }
 
-const BLOCKHASH_STALENESS_THRESHOLD: Duration = Duration::from_secs(10);
-const UPDATE_INTERVAL: Duration = Duration::from_millis(300);
+const BLOCKHASH_STALENESS_THRESHOLD: Duration = Duration::from_secs(5); // Reduced from 10s to 5s for better freshness
+const UPDATE_INTERVAL: Duration = Duration::from_millis(200); // Increased frequency from 300ms to 200ms
 
 pub struct BlockhashProcessor {
     rpc_client: Arc<RpcClient>,
