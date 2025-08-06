@@ -220,6 +220,10 @@ lazy_static::lazy_static! {
     static ref BOUGHT_TOKEN_LIST: Arc<DashMap<String, BoughtTokenInfo>> = Arc::new(DashMap::new());
     // Add: Permanent blacklist for tokens that have been bought before (never rebuy)
     static ref BOUGHT_TOKENS_BLACKLIST: Arc<DashMap<String, u64>> = Arc::new(DashMap::new());
+    // Add: Transaction signature tracking to prevent duplicate processing
+    static ref PROCESSED_SIGNATURES: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
+    // Add: Active buy operations to prevent concurrent buys for same token
+    static ref ACTIVE_BUY_OPERATIONS: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
 }
 
 // Initialize the global counters with default values
@@ -417,6 +421,16 @@ pub async fn start_copy_trading(config: CopyTradingConfig) -> Result<(), String>
         }
     });
     
+    // Spawn cleanup task for processed signatures and active operations
+    tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_secs(60)); // Run every minute
+        
+        loop {
+            interval.tick().await;
+            cleanup_old_processed_signatures();
+        }
+    });
+    
     // Main stream processing loop
     logger.log("Starting main processing loop...".green().to_string());
     while let Some(msg_result) = stream.next().await {
@@ -494,6 +508,78 @@ async fn verify_transaction(
     Err("Transaction verification failed after retries".to_string())
 }
 
+/// Check if a transaction signature has already been processed
+fn is_signature_already_processed(signature: &str) -> bool {
+    // Check if signature was processed recently (within last 5 minutes)
+    if let Some(processed_time) = PROCESSED_SIGNATURES.get(signature) {
+        let elapsed = processed_time.elapsed();
+        if elapsed.as_secs() < 300 { // 5 minutes
+            return true;
+        } else {
+            // Remove old entry
+            PROCESSED_SIGNATURES.remove(signature);
+        }
+    }
+    false
+}
+
+/// Mark a transaction signature as processed
+fn mark_signature_as_processed(signature: &str) {
+    PROCESSED_SIGNATURES.insert(signature.to_string(), Instant::now());
+}
+
+/// Check if there's already an active buy operation for a token
+fn is_buy_operation_active(token_mint: &str) -> bool {
+    if let Some(start_time) = ACTIVE_BUY_OPERATIONS.get(token_mint) {
+        let elapsed = start_time.elapsed();
+        if elapsed.as_secs() < 30 { // 30 seconds timeout
+            return true;
+        } else {
+            // Remove old entry
+            ACTIVE_BUY_OPERATIONS.remove(token_mint);
+        }
+    }
+    false
+}
+
+/// Mark a buy operation as active
+fn mark_buy_operation_active(token_mint: &str) {
+    ACTIVE_BUY_OPERATIONS.insert(token_mint.to_string(), Instant::now());
+}
+
+/// Remove active buy operation marker
+fn remove_buy_operation_active(token_mint: &str) {
+    ACTIVE_BUY_OPERATIONS.remove(token_mint);
+}
+
+/// Clean up old processed signatures (call periodically to prevent memory leaks)
+fn cleanup_old_processed_signatures() {
+    let now = Instant::now();
+    let mut to_remove = Vec::new();
+    
+    for entry in PROCESSED_SIGNATURES.iter() {
+        if now.duration_since(*entry.value()).as_secs() > 300 { // 5 minutes
+            to_remove.push(entry.key().clone());
+        }
+    }
+    
+    for signature in to_remove {
+        PROCESSED_SIGNATURES.remove(&signature);
+    }
+    
+    // Also cleanup old active buy operations
+    let mut buy_ops_to_remove = Vec::new();
+    for entry in ACTIVE_BUY_OPERATIONS.iter() {
+        if now.duration_since(*entry.value()).as_secs() > 30 { // 30 seconds
+            buy_ops_to_remove.push(entry.key().clone());
+        }
+    }
+    
+    for token_mint in buy_ops_to_remove {
+        ACTIVE_BUY_OPERATIONS.remove(&token_mint);
+    }
+}
+
 /// Execute buy operation based on detected transaction
 pub async fn execute_buy(
     trade_info: transaction_parser::TradeInfoFromToken,
@@ -504,11 +590,27 @@ pub async fn execute_buy(
     let logger = Logger::new("[EXECUTE-BUY] => ".green().to_string());
     let start_time = Instant::now();
     
+    // Check if this transaction signature has already been processed
+    if is_signature_already_processed(&trade_info.signature) {
+        logger.log(format!("🔄 Transaction signature {} already processed, skipping duplicate buy", trade_info.signature).yellow().to_string());
+        return Err("Transaction signature already processed".to_string());
+    }
+    
     // Check if this token is in the permanent blacklist (never rebuy)
     if BOUGHT_TOKENS_BLACKLIST.contains_key(&trade_info.mint) {
         logger.log(format!("🚫 Token {} is blacklisted (previously bought), skipping buy", trade_info.mint).yellow().to_string());
         return Err("Token is blacklisted - previously bought".to_string());
     }
+    
+    // Check if there's already an active buy operation for this token
+    if is_buy_operation_active(&trade_info.mint) {
+        logger.log(format!("⏳ Buy operation already active for token {}, skipping duplicate", trade_info.mint).yellow().to_string());
+        return Err("Buy operation already active for this token".to_string());
+    }
+    
+    // Mark signature as processed and buy operation as active
+    mark_signature_as_processed(&trade_info.signature);
+    mark_buy_operation_active(&trade_info.mint);
     
     // Create a modified swap config based on the trade_info
     let mut buy_config = (*swap_config).clone();
@@ -952,6 +1054,9 @@ pub async fn execute_buy(
             }
         },
     };
+    
+    // Clean up active buy operation marker
+    remove_buy_operation_active(&trade_info.mint);
     
     // Log execution time
     let elapsed = start_time.elapsed();
@@ -2913,7 +3018,11 @@ async fn process_message(
                 let txn = txn.clone();  // Clone the transaction data
                 tokio::spawn(async move {
                     if let Some(parsed_data) = crate::engine::transaction_parser::parse_transaction_data(&txn, &data) {
-                    let _ =  handle_parsed_data_for_buying(parsed_data, config, target_signature, &logger).await;
+                        // Log transaction signature for debugging
+                        if parsed_data.is_buy {
+                            logger.log(format!("📝 Processing buy transaction signature: {}", parsed_data.signature).cyan().to_string());
+                        }
+                        let _ = handle_parsed_data_for_buying(parsed_data, config, target_signature, &logger).await;
                     }
                 });
             }
