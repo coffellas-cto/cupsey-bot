@@ -425,6 +425,37 @@ async fn main() {
     cache_maintenance::start_cache_maintenance(60).await;
     println!("Cache maintenance service started");
 
+    // Initialize and start real-time blockhash processor for maximum transaction landing success
+    let blockhash_processor = match BlockhashProcessor::new(config.app_state.rpc_client.clone()).await {
+        Ok(processor) => processor,
+        Err(e) => {
+            eprintln!("Failed to create blockhash processor: {}", e);
+            return;
+        }
+    };
+    
+    // Start the regular blockhash processor
+    if let Err(e) = blockhash_processor.start().await {
+        eprintln!("Failed to start blockhash processor: {}", e);
+        return;
+    }
+    println!("✅ Blockhash processor started (100ms updates)");
+    
+    // Also start the REAL-TIME blockhash processor using gRPC if available
+    if let (Ok(grpc_url), Ok(grpc_token)) = (
+        std::env::var("YELLOWSTONE_GRPC_HTTP"),
+        std::env::var("YELLOWSTONE_GRPC_TOKEN")
+    ) {
+        if let Err(e) = blockhash_processor.start_realtime_with_grpc(grpc_url, grpc_token).await {
+            eprintln!("⚠️  Failed to start real-time blockhash processor: {}", e);
+            println!("Continuing with regular blockhash processor...");
+        } else {
+            println!("🚀 REAL-TIME blockhash processor started via gRPC - maximum freshness!");
+        }
+    } else {
+        println!("⚠️  gRPC credentials not found - using regular blockhash processor only");
+    }
+
     // Initialize and log selling strategy parameters
     let selling_config = solana_vntr_sniper::engine::selling_strategy::SellingConfig::set_from_env();
     let selling_engine = solana_vntr_sniper::engine::selling_strategy::SellingEngine::new(

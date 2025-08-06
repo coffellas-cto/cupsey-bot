@@ -1128,21 +1128,18 @@ async fn execute_pumpfun_emergency_sell_with_zeroslot(
         Ok((keypair, instructions, price)) => {
             logger.log(format!("🐋 Generated PumpFun whale emergency sell instruction at price: {}", price));
             
-            // For emergency sells, we need the freshest possible blockhash to ensure transaction lands
-            let recent_blockhash = match crate::services::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
-                Some(hash) => {
-                    logger.log("🐋 Using cached blockhash for emergency sell".cyan().to_string());
+            // For emergency sells, we need the ULTRA-FRESH blockhash to maximize landing success
+            let blockhash_processor = crate::services::blockhash_processor::BlockhashProcessor::new(app_state.rpc_client.clone()).await
+                .map_err(|e| format!("Failed to create blockhash processor: {}", e))?;
+                
+            let recent_blockhash = match blockhash_processor.get_ultra_fresh_blockhash().await {
+                Ok(hash) => {
+                    logger.log("🐋 Got ULTRA-FRESH blockhash for emergency sell".green().bold().to_string());
                     hash
                 },
-                None => {
-                    logger.log("🐋 Cached blockhash stale, fetching fresh blockhash directly from RPC".yellow().to_string());
-                    match app_state.rpc_client.get_latest_blockhash() {
-                        Ok(hash) => hash,
-                        Err(e) => {
-                            logger.log(format!("🐋 Failed to get fresh blockhash from RPC: {}", e).red().to_string());
-                            return Err(format!("Failed to get recent blockhash: {}", e));
-                        }
-                    }
+                Err(e) => {
+                    logger.log(format!("🐋 Failed to get ultra-fresh blockhash: {}", e).red().to_string());
+                    return Err(format!("Failed to get ultra-fresh blockhash: {}", e));
                 }
             };
             
