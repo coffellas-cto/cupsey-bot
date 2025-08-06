@@ -162,13 +162,13 @@ impl RpcConnectionPool {
 /// Check if signature was already processed using bloom filter
 pub fn is_signature_processed(signature: &str) -> bool {
     let mut bloom = SIGNATURE_BLOOM.lock().unwrap();
-    bloom.contains(signature)
+    bloom.contains(&signature.as_bytes())
 }
 
 /// Mark signature as processed in bloom filter
 pub fn mark_signature_processed(signature: &str) {
     let mut bloom = SIGNATURE_BLOOM.lock().unwrap();
-    bloom.insert(signature);
+    bloom.insert(&signature.as_bytes());
 }
 
 /// Optimized transaction verification with circuit breaker and bloom filter
