@@ -255,6 +255,61 @@ impl TimeExitConfig {
         }
     }
 }
+
+/// Configuration for dynamic whale selling based on PNL thresholds
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicWhaleSelling {
+    pub whale_selling_thresholds: Vec<WhaleSellingThreshold>,
+    pub retracement_pnl_threshold: f64,   // PNL threshold to enable retracement logic
+    pub retracement_percentage: f64,      // Retracement percentage when PNL > threshold
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhaleSellingThreshold {
+    pub pnl_threshold: f64,        // PNL percentage threshold
+    pub whale_limit_sol: f64,      // SOL limit for whale selling
+    pub use_emergency_zeroslot: bool, // Whether to use emergency zeroslot selling
+}
+
+impl Default for DynamicWhaleSelling {
+    fn default() -> Self {
+        Self {
+            whale_selling_thresholds: vec![
+                WhaleSellingThreshold { pnl_threshold: 10.0, whale_limit_sol: 3.0, use_emergency_zeroslot: true },
+                WhaleSellingThreshold { pnl_threshold: 30.0, whale_limit_sol: 4.0, use_emergency_zeroslot: true },
+                WhaleSellingThreshold { pnl_threshold: 50.0, whale_limit_sol: 5.0, use_emergency_zeroslot: true },
+                WhaleSellingThreshold { pnl_threshold: 200.0, whale_limit_sol: 6.0, use_emergency_zeroslot: true },
+                WhaleSellingThreshold { pnl_threshold: 500.0, whale_limit_sol: 7.0, use_emergency_zeroslot: true },
+                WhaleSellingThreshold { pnl_threshold: 1000.0, whale_limit_sol: 7.0, use_emergency_zeroslot: true },
+            ],
+            retracement_pnl_threshold: 25.0,  // Only apply retracement logic when PNL > 25%
+            retracement_percentage: 15.0,     // 15% retracement threshold
+        }
+    }
+}
+
+impl DynamicWhaleSelling {
+    pub fn set_from_env() -> Self {
+        let retracement_pnl_threshold = import_env_var("RETRACEMENT_PNL_THRESHOLD").parse::<f64>().unwrap_or(25.0);
+        let retracement_percentage = import_env_var("DYNAMIC_RETRACEMENT_PERCENTAGE").parse::<f64>().unwrap_or(15.0);
+        
+        // Use default thresholds for now, could be configurable via env vars if needed
+        Self {
+            whale_selling_thresholds: Self::default().whale_selling_thresholds,
+            retracement_pnl_threshold,
+            retracement_percentage,
+        }
+    }
+    
+    /// Get the appropriate whale selling threshold based on current PNL
+    pub fn get_whale_threshold_for_pnl(&self, pnl: f64) -> Option<&WhaleSellingThreshold> {
+        // Find the highest threshold that this PNL qualifies for
+        self.whale_selling_thresholds
+            .iter()
+            .rev() // Start from highest thresholds
+            .find(|threshold| pnl >= threshold.pnl_threshold)
+    }
+}
 /// Configuration for selling strategy
 #[derive(Clone, Debug)]
 pub struct SellingConfig {
@@ -269,6 +324,7 @@ pub struct SellingConfig {
     pub liquidity_monitor: LiquidityMonitorConfig,
     pub volume_analysis: VolumeAnalysisConfig,
     pub time_based: TimeExitConfig,
+    pub dynamic_whale_selling: DynamicWhaleSelling,
 }
 
 impl Default for SellingConfig {
@@ -276,7 +332,7 @@ impl Default for SellingConfig {
         Self {
             take_profit: 25.0,               // 25% profit target  
             stop_loss: -30.0,                // 30% stop loss
-            max_hold_time: 86400,            // 24 hours max hold time
+            max_hold_time: 3600,             // 1 hour max hold time (updated from 24 hours)
             retracement_threshold: 15.0,     // 15% retracement threshold
             min_liquidity: 1.0,              // 1 SOL minimum liquidity
             
@@ -286,6 +342,7 @@ impl Default for SellingConfig {
             liquidity_monitor: LiquidityMonitorConfig::default(),
             volume_analysis: VolumeAnalysisConfig::default(),
             time_based: TimeExitConfig::default(),
+            dynamic_whale_selling: DynamicWhaleSelling::default(),
         }
     }
 }
@@ -294,7 +351,7 @@ impl SellingConfig {
     pub fn set_from_env() -> Self {
         let take_profit = import_env_var("TAKE_PROFIT").parse::<f64>().unwrap_or(25.0);
         let stop_loss = import_env_var("STOP_LOSS").parse::<f64>().unwrap_or(-30.0);
-        let max_hold_time = import_env_var("MAX_HOLD_TIME").parse::<u64>().unwrap_or(86400);
+        let max_hold_time = import_env_var("MAX_HOLD_TIME").parse::<u64>().unwrap_or(3600); // Default to 1 hour
         let retracement_threshold = import_env_var("RETRACEMENT_THRESHOLD").parse::<f64>().unwrap_or(15.0);
         let min_liquidity = import_env_var("MIN_LIQUIDITY").parse::<f64>().unwrap_or(1.0);
         let profit_taking = ProfitTakingConfig::set_from_env();
@@ -302,6 +359,7 @@ impl SellingConfig {
         let liquidity_monitor = LiquidityMonitorConfig::set_from_env();
         let volume_analysis = VolumeAnalysisConfig::set_from_env();
         let time_based = TimeExitConfig::set_from_env();
+        let dynamic_whale_selling = DynamicWhaleSelling::set_from_env();
 
         Self {
             take_profit,
@@ -314,6 +372,7 @@ impl SellingConfig {
             liquidity_monitor,
             volume_analysis,
             time_based,
+            dynamic_whale_selling,
         }   
     }
 }
@@ -540,25 +599,62 @@ impl TokenManager {
 
             // Check if we should sell this token
             match engine.evaluate_sell_conditions(&token_mint).await {
-                Ok((should_sell, is_emergency)) => {
+                Ok((should_sell, is_emergency, use_whale_emergency)) => {
                     if should_sell {
                         if is_emergency {
-                            // Spawn emergency sell task
-                            tokio::spawn(async move {
-                                // Create trade info for emergency sell
-                                match engine_clone.metrics_to_trade_info(&token_mint_clone).await {
-                                    Ok(trade_info) => {
-                                        if let Err(e) = engine_clone.emergency_sell_all(&token_mint_clone, &trade_info, SwapProtocol::PumpFun).await {
-                                            let logger = Logger::new("[TOKEN-MANAGER-EMERGENCY] => ".red().to_string());
-                                            logger.log(format!("Failed to emergency sell token {}: {}", token_mint_clone, e));
+                            if use_whale_emergency {
+                                // Spawn whale emergency sell task
+                                tokio::spawn(async move {
+                                    // Create trade info for whale emergency sell
+                                    match engine_clone.metrics_to_trade_info(&token_mint_clone).await {
+                                        Ok(trade_info) => {
+                                            // Get the whale threshold for this PNL level
+                                            if let Some(metrics) = TOKEN_METRICS.get(&token_mint_clone) {
+                                                let pnl = if metrics.entry_price > 0.0 {
+                                                    (metrics.current_price - metrics.entry_price) / metrics.entry_price * 100.0
+                                                } else {
+                                                    0.0
+                                                };
+                                                
+                                                if let Some(whale_threshold) = engine_clone.get_config().dynamic_whale_selling.get_whale_threshold_for_pnl(pnl) {
+                                                    if let Err(e) = engine_clone.whale_emergency_sell(&token_mint_clone, &trade_info, SwapProtocol::PumpFun, whale_threshold).await {
+                                                        let logger = Logger::new("[TOKEN-MANAGER-WHALE] => ".red().to_string());
+                                                        logger.log(format!("Failed to whale emergency sell token {}: {}", token_mint_clone, e));
+                                                    }
+                                                } else {
+                                                    let logger = Logger::new("[TOKEN-MANAGER-WHALE] => ".yellow().to_string());
+                                                    logger.log(format!("No whale threshold found for PNL {:.2}%, falling back to emergency sell", pnl));
+                                                    if let Err(e) = engine_clone.emergency_sell_all(&token_mint_clone, &trade_info, SwapProtocol::PumpFun).await {
+                                                        let logger = Logger::new("[TOKEN-MANAGER-EMERGENCY] => ".red().to_string());
+                                                        logger.log(format!("Failed to emergency sell token {}: {}", token_mint_clone, e));
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        Err(e) => {
+                                            let logger = Logger::new("[TOKEN-MANAGER-WHALE] => ".red().to_string());
+                                            logger.log(format!("Failed to create trade info for whale emergency sell {}: {}", token_mint_clone, e));
                                         }
-                                    },
-                                    Err(e) => {
-                                        let logger = Logger::new("[TOKEN-MANAGER-EMERGENCY] => ".red().to_string());
-                                        logger.log(format!("Failed to create trade info for emergency sell {}: {}", token_mint_clone, e));
                                     }
-                                }
-                            });
+                                });
+                            } else {
+                                // Spawn regular emergency sell task
+                                tokio::spawn(async move {
+                                    // Create trade info for emergency sell
+                                    match engine_clone.metrics_to_trade_info(&token_mint_clone).await {
+                                        Ok(trade_info) => {
+                                            if let Err(e) = engine_clone.emergency_sell_all(&token_mint_clone, &trade_info, SwapProtocol::PumpFun).await {
+                                                let logger = Logger::new("[TOKEN-MANAGER-EMERGENCY] => ".red().to_string());
+                                                logger.log(format!("Failed to emergency sell token {}: {}", token_mint_clone, e));
+                                            }
+                                        },
+                                        Err(e) => {
+                                            let logger = Logger::new("[TOKEN-MANAGER-EMERGENCY] => ".red().to_string());
+                                            logger.log(format!("Failed to create trade info for emergency sell {}: {}", token_mint_clone, e));
+                                        }
+                                    }
+                                });
+                            }
                         } else {
                             // Spawn normal sell task
                             let token_mint_clone = token_mint.clone();
@@ -620,17 +716,34 @@ impl SellingEngine {
         }
     }
     
+    /// Get a reference to the selling configuration
+    pub fn get_config(&self) -> &SellingConfig {
+        &self.config
+    }
+    
     /// Log current selling strategy parameters
     pub fn log_selling_parameters(&self) {
         self.logger.log("📊 SELLING STRATEGY PARAMETERS:".cyan().bold().to_string());
         self.logger.log(format!("  🎯 Take Profit: {:.1}%", self.config.take_profit).green().to_string());
         self.logger.log(format!("  🛑 Stop Loss: {:.1}%", self.config.stop_loss).red().to_string());
-        self.logger.log(format!("  ⏰ Max Hold Time: {} hours", self.config.max_hold_time / 3600).blue().to_string());
-        self.logger.log(format!("  📉 Retracement Threshold: {:.1}%", self.config.retracement_threshold).yellow().to_string());
+        self.logger.log(format!("  ⏰ Max Hold Time: {} hour(s)", self.config.max_hold_time / 3600).blue().to_string());
+        self.logger.log(format!("  📉 Retracement Threshold: {:.1}% (only when PNL > {:.1}%)", 
+                               self.config.dynamic_whale_selling.retracement_percentage,
+                               self.config.dynamic_whale_selling.retracement_pnl_threshold).yellow().to_string());
         self.logger.log(format!("  💧 Min Liquidity: {:.1} SOL", self.config.min_liquidity).purple().to_string());
         self.logger.log("  ⚠️  Trailing Stop: DISABLED".red().to_string());
         self.logger.log("  🚫 Token Rebuying: DISABLED (permanent blacklist)".red().to_string());
         self.logger.log("  🚀 Copy Selling Method: ZEROSLOT".green().to_string());
+        
+        // Log dynamic whale selling thresholds
+        self.logger.log("  🐋 DYNAMIC WHALE SELLING THRESHOLDS:".cyan().bold().to_string());
+        for threshold in &self.config.dynamic_whale_selling.whale_selling_thresholds {
+            self.logger.log(format!("    💎 PNL >= {:.0}%: Whale Limit {:.1} SOL (Emergency Zeroslot: {})", 
+                                   threshold.pnl_threshold, 
+                                   threshold.whale_limit_sol,
+                                   if threshold.use_emergency_zeroslot { "✅" } else { "❌" }
+                                   ).cyan().to_string());
+        }
     }
     
     /// Check for existing token balances and initialize them for copy selling
@@ -1007,73 +1120,81 @@ impl SellingEngine {
     /// This method combines all selling conditions from the enhanced decision framework
     /// into a single evaluation, providing a comprehensive analysis of when to exit a position.
     /// 
-    /// Returns: (should_sell, sell_all) where:
+    /// Returns: (should_sell, sell_all, use_whale_emergency) where:
     /// - should_sell: true if any sell condition is met
     /// - sell_all: true if emergency conditions require selling all tokens immediately
-    pub async fn evaluate_sell_conditions(&self, token_mint: &str) -> Result<(bool, bool)> {
+    /// - use_whale_emergency: true if should use emergency zeroslot selling for whale transactions
+    pub async fn evaluate_sell_conditions(&self, token_mint: &str) -> Result<(bool, bool, bool)> {
         // Get metrics for the token using DashMap's get() method
         let metrics = match TOKEN_METRICS.get(token_mint) {
             Some(metrics) => metrics.clone(),
-            None => return Ok((false, false)), // No metrics, so nothing to sell
+            None => return Ok((false, false, false)), // No metrics, so nothing to sell
         };
         
         // Calculate time held
         let time_held = metrics.last_update.elapsed().as_secs();
         
-        // Check if we've exceeded the max hold time
-        if time_held > self.config.max_hold_time {
-            self.logger.log(format!("Selling due to max hold time exceeded: {} > {}", 
-                             time_held, self.config.max_hold_time).yellow().to_string());
-            return Ok((true, false));
-        }
-        
-        // Use the current price from metrics (which is updated by update_metrics)
-        let current_price = metrics.current_price;
+        // Calculate percentage gain from entry (PNL)
+        let pnl = if metrics.entry_price > 0.0 {
+            (metrics.current_price - metrics.entry_price) / metrics.entry_price * 100.0
+        } else {
+            0.0
+        };
         
         // Calculate percentage change from highest price
         let retracement = if metrics.highest_price > 0.0 {
-            (metrics.highest_price - current_price) / metrics.highest_price * 100.0
+            (metrics.highest_price - metrics.current_price) / metrics.highest_price * 100.0
         } else {
             0.0
         };
         
-        // Calculate percentage gain from entry
-        let gain = if metrics.entry_price > 0.0 {
-            (current_price - metrics.entry_price) / metrics.entry_price * 100.0
-        } else {
-            0.0
-        };
-        
-        // Log metrics
+        // Log metrics with updated PNL terminology
         self.logger.log(format!(
-            "Token: {}, Current Price: {:.8}, Entry: {:.8}, High: {:.8}, Gain: {:.2}%, Retracement: {:.2}%",
-            token_mint, current_price, metrics.entry_price, metrics.highest_price, gain, retracement
+            "Token: {}, Current Price: {:.8}, Entry: {:.8}, High: {:.8}, PNL: {:.2}%, Retracement: {:.2}%, Time Held: {}s",
+            token_mint, metrics.current_price, metrics.entry_price, metrics.highest_price, pnl, retracement, time_held
         ).blue().to_string());
         
-        // Check if we've reached take profit
-        if gain >= self.config.take_profit {
-            self.logger.log(format!("Selling due to take profit reached: {:.2}% >= {:.2}%", 
-                             gain, self.config.take_profit).green().to_string());
-            return Ok((true, false));
+        // Check for dynamic whale selling based on PNL thresholds
+        if let Some(whale_threshold) = self.config.dynamic_whale_selling.get_whale_threshold_for_pnl(pnl) {
+            self.logger.log(format!(
+                "🐋 Dynamic whale selling triggered: PNL {:.2}% >= {:.2}%, whale limit: {:.1} SOL",
+                pnl, whale_threshold.pnl_threshold, whale_threshold.whale_limit_sol
+            ).cyan().bold().to_string());
+            
+            return Ok((true, true, whale_threshold.use_emergency_zeroslot));
+        }
+        
+        // Max Hold Time: Sell after 1 hour regardless of performance
+        if time_held > self.config.max_hold_time {
+            self.logger.log(format!("⏰ Selling due to max hold time exceeded: {}s > {}s (1 hour)", 
+                             time_held, self.config.max_hold_time).yellow().to_string());
+            return Ok((true, true, false)); // Emergency sell but not whale emergency
         }
         
         // Check if we've hit stop loss
-        if gain <= self.config.stop_loss {
-            self.logger.log(format!("Selling due to stop loss triggered: {:.2}% <= {:.2}%", 
-                             gain, self.config.stop_loss).red().to_string());
-            return Ok((true, true));
+        if pnl <= self.config.stop_loss {
+            self.logger.log(format!("🛑 Selling due to stop loss triggered: {:.2}% <= {:.2}%", 
+                             pnl, self.config.stop_loss).red().to_string());
+            return Ok((true, true, false));
         }
         
-        // Trailing Stop Logic - DISABLED
-        // Note: Trailing stop functionality has been removed per requirements
-        
-        // Use retracement threshold as fallback (only if still in profit)
-        if retracement >= self.config.retracement_threshold && gain > 0.0 {
+        // Retracement logic: Only apply when PNL > 25% and price drops 15% from highest point (only if still profitable)
+        if pnl > self.config.dynamic_whale_selling.retracement_pnl_threshold && 
+           pnl > 0.0 && 
+           retracement >= self.config.dynamic_whale_selling.retracement_percentage {
             self.logger.log(format!(
-                "Selling due to excessive retracement: {:.2}% >= {:.2}% (still in profit: {:.2}%)",
-                retracement, self.config.retracement_threshold, gain
+                "📉 Selling due to retracement: {:.2}% >= {:.2}% (PNL: {:.2}% > {:.2}%, still profitable)",
+                retracement, self.config.dynamic_whale_selling.retracement_percentage, 
+                pnl, self.config.dynamic_whale_selling.retracement_pnl_threshold
             ).yellow().to_string());
-            return Ok((true, false));
+            return Ok((true, false, false));
+        }
+        
+        // Standard take profit (fallback for lower PNL levels)
+        if pnl >= self.config.take_profit {
+            self.logger.log(format!("🎯 Selling due to take profit reached: {:.2}% >= {:.2}%", 
+                             pnl, self.config.take_profit).green().to_string());
+            return Ok((true, false, false));
         }
 
         // Enhanced liquidity monitoring
@@ -1082,30 +1203,30 @@ impl SellingEngine {
             
             // Check absolute liquidity level
             if metrics.liquidity_at_current < self.config.liquidity_monitor.min_absolute_liquidity {
-                self.logger.log(format!("Selling due to low absolute liquidity: {:.2} SOL < {:.2} SOL", 
+                self.logger.log(format!("💧 Selling due to low absolute liquidity: {:.2} SOL < {:.2} SOL", 
                                  metrics.liquidity_at_current, self.config.liquidity_monitor.min_absolute_liquidity).red().to_string());
-                return Ok((true, true));
+                return Ok((true, true, false));
             }
             
             // Check liquidity drop percentage
             if liquidity_drop >= self.config.liquidity_monitor.max_acceptable_drop * 100.0 {
-                self.logger.log(format!("Selling due to liquidity drop: {:.2}% >= {:.2}%", 
+                self.logger.log(format!("💧 Selling due to liquidity drop: {:.2}% >= {:.2}%", 
                                  liquidity_drop, self.config.liquidity_monitor.max_acceptable_drop * 100.0).red().to_string());
-                return Ok((true, true));
+                return Ok((true, true, false));
             }
         }
         
         // Check if copy targets are selling
         match self.is_copy_target_selling(token_mint).await {
             Ok(true) => {
-                self.logger.log("Selling because copy targets are selling".yellow().to_string());
-                return Ok((true, false));
+                self.logger.log("👥 Selling because copy targets are selling".yellow().to_string());
+                return Ok((true, false, false));
             },
             _ => {}, // Ignore errors or false result
         }
         
         // If we've reached here, no sell conditions met
-        Ok((false, false))
+        Ok((false, false, false))
     }
     
     /// Check if any copy targets are selling this token
@@ -1609,6 +1730,184 @@ impl SellingEngine {
     }
 
 
+
+    /// Whale emergency sell using zeroslot for maximum speed when PNL thresholds are met
+    pub async fn whale_emergency_sell(&self, token_mint: &str, parsed_data: &TradeInfoFromToken, protocol: SwapProtocol, whale_threshold: &WhaleSellingThreshold) -> Result<()> {
+        self.logger.log(format!("🐋 WHALE EMERGENCY SELL triggered for token: {} (PNL >= {:.1}%, Limit: {:.1} SOL)", 
+                               token_mint, whale_threshold.pnl_threshold, whale_threshold.whale_limit_sol).cyan().bold().to_string());
+        
+        // Get wallet pubkey
+        let wallet_pubkey = self.app_state.wallet.try_pubkey()
+            .map_err(|e| anyhow!("Failed to get wallet pubkey: {}", e))?;
+
+        // Get token account to determine how much we own
+        let token_pubkey = Pubkey::from_str(token_mint)
+            .map_err(|e| anyhow!("Invalid token mint address: {}", e))?;
+        let ata = get_associated_token_address(&wallet_pubkey, &token_pubkey);
+
+        // Get current token balance
+        let token_amount = match self.app_state.rpc_nonblocking_client.get_token_account(&ata).await {
+            Ok(Some(account)) => {
+                let amount_value = account.token_amount.amount.parse::<f64>()
+                    .map_err(|e| anyhow!("Failed to parse token amount: {}", e))?;
+                let decimal_amount = amount_value / 10f64.powi(account.token_amount.decimals as i32);
+                self.logger.log(format!("🐋 Whale selling {} tokens", decimal_amount).cyan().to_string());
+                decimal_amount
+            },
+            Ok(None) => {
+                return Err(anyhow!("No token account found for mint: {}", token_mint));
+            },
+            Err(e) => {
+                return Err(anyhow!("Failed to get token account: {}", e));
+            }
+        };
+
+        if token_amount <= 0.0 {
+            self.logger.log("No tokens to sell".yellow().to_string());
+            return Ok(());
+        }
+
+        // Create whale emergency sell config with higher slippage tolerance for speed
+        let mut whale_config = (*self.swap_config).clone();
+        whale_config.swap_direction = SwapDirection::Sell;
+        whale_config.amount_in = token_amount;
+        whale_config.slippage = 1500; // 15% slippage for whale emergency sells (higher than normal)
+
+        // Create trade info for whale emergency sell
+        let whale_trade_info = TradeInfoFromToken {
+            dex_type: match protocol {
+                SwapProtocol::PumpSwap => crate::engine::transaction_parser::DexType::PumpSwap,
+                SwapProtocol::PumpFun => crate::engine::transaction_parser::DexType::PumpFun,
+                _ => crate::engine::transaction_parser::DexType::Unknown,
+            },
+            slot: parsed_data.slot,
+            signature: "whale_emergency_sell".to_string(),
+            pool_id: parsed_data.pool_id.clone(),
+            mint: token_mint.to_string(),
+            timestamp: parsed_data.timestamp,
+            is_buy: false,
+            price: parsed_data.price,
+            is_reverse_when_pump_swap: parsed_data.is_reverse_when_pump_swap,
+            coin_creator: parsed_data.coin_creator.clone(),
+            sol_change: parsed_data.sol_change,
+            token_change: token_amount,
+            liquidity: parsed_data.liquidity,
+            virtual_sol_reserves: parsed_data.virtual_sol_reserves,
+            virtual_token_reserves: parsed_data.virtual_token_reserves,
+        };
+
+        // Execute whale emergency sell using zeroslot for maximum speed
+        let result = match protocol {
+            SwapProtocol::PumpFun => {
+                self.logger.log("🐋 Using PumpFun protocol for whale emergency sell with zeroslot".cyan().to_string());
+                
+                let pump = crate::dex::pump_fun::Pump::new(
+                    self.app_state.rpc_nonblocking_client.clone(),
+                    self.app_state.rpc_client.clone(),
+                    self.app_state.wallet.clone(),
+                );
+                
+                match pump.build_swap_from_parsed_data(&whale_trade_info, whale_config).await {
+                    Ok((keypair, instructions, price)) => {
+                        // Get recent blockhash from the processor
+                        let recent_blockhash = match crate::services::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
+                            Some(hash) => hash,
+                            None => {
+                                self.logger.log("Failed to get recent blockhash".red().to_string());
+                                return Err(anyhow!("Failed to get recent blockhash"));
+                            }
+                        };
+                        self.logger.log(format!("🐋 Generated whale PumpFun sell instruction at price: {}", price));
+                        
+                        // Execute with zeroslot for maximum speed
+                        match crate::core::tx::new_signed_and_send_zeroslot(
+                            self.app_state.zeroslot_rpc_client.clone(),
+                            recent_blockhash,
+                            &keypair,
+                            instructions,
+                            &self.logger,
+                        ).await {
+                            Ok(signatures) => {
+                                if signatures.is_empty() {
+                                    return Err(anyhow!("No transaction signature returned"));
+                                }
+                                
+                                let signature = &signatures[0];
+                                self.logger.log(format!("🐋 Whale emergency sell transaction sent: {}", signature).green().bold().to_string());
+                                
+                                Ok(())
+                            },
+                            Err(e) => {
+                                self.logger.log(format!("🐋 Whale emergency sell transaction failed: {}", e).red().to_string());
+                                Err(anyhow!("Failed to send whale emergency sell transaction: {}", e))
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        self.logger.log(format!("Failed to build whale PumpFun sell instruction: {}", e).red().to_string());
+                        Err(anyhow!("Failed to build whale sell instruction: {}", e))
+                    }
+                }
+            },
+            SwapProtocol::PumpSwap => {
+                self.logger.log("🐋 Using PumpSwap protocol for whale emergency sell with zeroslot".cyan().to_string());
+                
+                let pump_swap = crate::dex::pump_swap::PumpSwap::new(
+                    self.app_state.wallet.clone(),
+                    Some(self.app_state.rpc_client.clone()),
+                    Some(self.app_state.rpc_nonblocking_client.clone()),
+                );
+                
+                match pump_swap.build_swap_from_parsed_data(&whale_trade_info, whale_config).await {
+                    Ok((keypair, instructions, price)) => {
+                        // Get recent blockhash from the processor
+                        let recent_blockhash = match crate::services::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
+                            Some(hash) => hash,
+                            None => {
+                                self.logger.log("Failed to get recent blockhash".red().to_string());
+                                return Err(anyhow!("Failed to get recent blockhash"));
+                            }
+                        };
+                        self.logger.log(format!("🐋 Generated whale PumpSwap sell instruction at price: {}", price));
+                        
+                        // Execute with zeroslot for maximum speed
+                        match crate::core::tx::new_signed_and_send_zeroslot(
+                            self.app_state.zeroslot_rpc_client.clone(),
+                            recent_blockhash,
+                            &keypair,
+                            instructions,
+                            &self.logger,
+                        ).await {
+                            Ok(signatures) => {
+                                if signatures.is_empty() {
+                                    return Err(anyhow!("No transaction signature returned"));
+                                }
+                                
+                                let signature = &signatures[0];
+                                self.logger.log(format!("🐋 Whale emergency sell transaction sent: {}", signature).green().bold().to_string());
+                                
+                                Ok(())
+                            },
+                            Err(e) => {
+                                self.logger.log(format!("🐋 Whale emergency sell transaction failed: {}", e).red().to_string());
+                                Err(anyhow!("Failed to send whale emergency sell transaction: {}", e))
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        self.logger.log(format!("Failed to build whale PumpSwap sell instruction: {}", e).red().to_string());
+                        Err(anyhow!("Failed to build whale sell instruction: {}", e))
+                    }
+                }
+            },
+            _ => {
+                self.logger.log("🐋 Unknown protocol, defaulting to PumpFun for whale emergency sell".yellow().to_string());
+                return Box::pin(self.whale_emergency_sell(token_mint, parsed_data, SwapProtocol::PumpFun, whale_threshold)).await;
+            }
+        };
+
+        result
+    }
 
     /// Emergency sell all tokens immediately to prevent further losses
     pub async fn emergency_sell_all(&self, token_mint: &str, parsed_data: &TradeInfoFromToken, protocol: SwapProtocol) -> Result<()> {

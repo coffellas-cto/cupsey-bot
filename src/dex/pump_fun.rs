@@ -54,6 +54,10 @@ pub const INITIAL_VIRTUAL_SOL_RESERVES: u64 = 30_000_000_000;
 pub const INITIAL_VIRTUAL_TOKEN_RESERVES: u64 = 1_073_000_000_000_000;
 pub const TOKEN_TOTAL_SUPPLY: u64 = 1_000_000_000_000_000;
 
+// Volume accumulator seeds
+pub const GLOBAL_VOLUME_ACCUMULATOR_SEED: &[u8] = b"global_volume_accumulator";
+pub const USER_VOLUME_ACCUMULATOR_SEED: &[u8] = b"user_volume_accumulator";
+
 
 #[derive(Clone)]
 pub struct Pump {
@@ -210,6 +214,10 @@ impl Pump {
         let bonding_curve = get_pda(&Pubkey::from_str(mint_str)?, &pump_program)?;
         let associated_bonding_curve = get_associated_token_address(&bonding_curve, &Pubkey::from_str(mint_str)?);
 
+        // Get volume accumulator PDAs
+        let global_volume_accumulator = get_global_volume_accumulator_pda(&pump_program)?;
+        let user_volume_accumulator = get_user_volume_accumulator_pda(&owner, &pump_program)?;
+
         // Determine if this is a buy or sell operation
         let (token_in, token_out, pump_method) = match swap_config.swap_direction {
             SwapDirection::Buy => (native_mint, Pubkey::from_str(mint_str)?, PUMP_BUY_METHOD),
@@ -308,6 +316,8 @@ impl Pump {
                         AccountMeta::new(creator_vault, false),
                         AccountMeta::new_readonly(Pubkey::from_str(PUMP_EVENT_AUTHORITY)?, false),
                         AccountMeta::new_readonly(pump_program, false),
+                        AccountMeta::new(global_volume_accumulator, false),
+                        AccountMeta::new(user_volume_accumulator, false),
                     ]
                 )
             },
@@ -378,6 +388,8 @@ impl Pump {
                         AccountMeta::new_readonly(token_program_id, false),
                         AccountMeta::new_readonly(Pubkey::from_str(PUMP_EVENT_AUTHORITY)?, false),
                         AccountMeta::new_readonly(pump_program, false),
+                        AccountMeta::new(global_volume_accumulator, false),
+                        AccountMeta::new(user_volume_accumulator, false),
                     ]
                 )
             }
@@ -449,6 +461,27 @@ pub struct BondingCurveAccount {
 pub struct BondingCurveReserves {
     pub virtual_token_reserves: u64,
     pub virtual_sol_reserves: u64,
+}
+
+#[derive(Debug, BorshSerialize, BorshDeserialize)]
+pub struct GlobalVolumeAccumulator {
+    pub start_time: i64,
+    pub end_time: i64,
+    pub seconds_in_a_day: i64,
+    pub mint: Pubkey,
+    pub total_token_supply: [u64; 30],
+    pub sol_volumes: [u64; 30],
+}
+
+#[derive(Debug, BorshSerialize, BorshDeserialize)]
+pub struct UserVolumeAccumulator {
+    pub user: Pubkey,
+    pub needs_claim: bool,
+    pub total_unclaimed_tokens: u64,
+    pub total_claimed_tokens: u64,
+    pub current_sol_volume: u64,
+    pub last_update_timestamp: i64,
+    pub has_total_claimed_tokens: bool,
 }
 
 pub fn get_bonding_curve_account_by_calc(
@@ -549,4 +582,18 @@ pub fn get_pda(mint: &Pubkey, program_id: &Pubkey ) -> Result<Pubkey> {
     let seeds = [b"bonding-curve".as_ref(), mint.as_ref()];
     let (bonding_curve, _bump) = Pubkey::find_program_address(&seeds, program_id);
     Ok(bonding_curve)
+}
+
+/// Get the global volume accumulator PDA
+pub fn get_global_volume_accumulator_pda(program_id: &Pubkey) -> Result<Pubkey> {
+    let seeds = [GLOBAL_VOLUME_ACCUMULATOR_SEED];
+    let (pda, _bump) = Pubkey::find_program_address(&seeds, program_id);
+    Ok(pda)
+}
+
+/// Get the user volume accumulator PDA for a specific user
+pub fn get_user_volume_accumulator_pda(user: &Pubkey, program_id: &Pubkey) -> Result<Pubkey> {
+    let seeds = [USER_VOLUME_ACCUMULATOR_SEED, user.as_ref()];
+    let (pda, _bump) = Pubkey::find_program_address(&seeds, program_id);
+    Ok(pda)
 }

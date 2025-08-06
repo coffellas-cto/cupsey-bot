@@ -1550,69 +1550,18 @@ async fn start_enhanced_selling_monitor(
     }
 }
 
-/// Update token price from current market data
-async fn update_token_price(
+/// Update token price from TradeInfoFromToken (transaction-driven only)
+/// This function is now only used for updating prices from parsed transaction data
+async fn update_token_price_from_trade_info(
     token_mint: &str,
-    app_state: &Arc<AppState>,
+    trade_info: &crate::engine::transaction_parser::TradeInfoFromToken,
 ) -> Result<(), String> {
     if let Some(mut token_info) = BOUGHT_TOKEN_LIST.get_mut(token_mint) {
-        let current_price = match token_info.protocol {
-            SwapProtocol::PumpFun => {
-                let pump = crate::dex::pump_fun::Pump::new(
-                    app_state.rpc_nonblocking_client.clone(),
-                    app_state.rpc_client.clone(),
-                    app_state.wallet.clone(),
-                );
-                
-                match pump.get_token_price(token_mint).await {
-                    Ok(price) => price as u64, // Price is already scaled from get_token_price()
-                    Err(_) => return Err("Failed to get PumpFun price".to_string()),
-                }
-            },
-            SwapProtocol::PumpSwap => {
-                let pump_swap = crate::dex::pump_swap::PumpSwap::new(
-                    app_state.wallet.clone(),
-                    Some(app_state.rpc_client.clone()),
-                    Some(app_state.rpc_nonblocking_client.clone()),
-                );
-                
-                match pump_swap.get_token_price(token_mint).await {
-                    Ok(price) => (price * 1_000_000_000.0) as u64, // PumpSwap still needs scaling
-                    Err(_) => return Err("Failed to get PumpSwap price".to_string()),
-                }
-            },
-            SwapProtocol::RaydiumLaunchpad => {
-                let raydium = crate::dex::raydium_launchpad::Raydium::new(
-                    app_state.wallet.clone(),
-                    Some(app_state.rpc_client.clone()),
-                    Some(app_state.rpc_nonblocking_client.clone()),
-                );
-                
-                match raydium.get_token_price(token_mint).await {
-                    Ok(price) => (price * 1_000_000_000.0) as u64, // Raydium still needs scaling
-                    Err(_) => return Err("Failed to get Raydium price".to_string()),
-                }
-            },
-            SwapProtocol::Auto | SwapProtocol::Unknown => {
-                // For Auto/Unknown protocols, try PumpFun first
-                let pump_fun = crate::dex::pump_fun::Pump::new(
-                    app_state.rpc_nonblocking_client.clone(),
-                    app_state.rpc_client.clone(),
-                    app_state.wallet.clone(),
-                );
-                
-                match pump_fun.get_token_price(token_mint).await {
-                    Ok(price) => price as u64, // Price is already scaled from get_token_price()
-                    Err(_) => {
-                        // If PumpFun fails, fall back to current price from token info
-                        token_info.current_price
-                    },
-                }
-            },
-        };
+        // Use the price from the parsed transaction data directly
+        let current_price = trade_info.price;
         
         // Debug logging for price updates
-        println!("DEBUG PRICE UPDATE: Token {} - Protocol: {:?}, Old: {}, New: {}", 
+        println!("DEBUG PRICE UPDATE FROM TRANSACTION: Token {} - Protocol: {:?}, Old: {}, New: {}", 
             token_mint, token_info.protocol, token_info.current_price, current_price);
         
         // Update the price using the enhanced method
@@ -3004,6 +2953,11 @@ async fn handle_parsed_data_for_selling(
         SellingConfig::set_from_env(), // SellingConfig::default(), 
     );
     
+    // Update token price from transaction data (no external API calls)
+    if let Err(e) = update_token_price_from_trade_info(&mint, &parsed_data).await {
+        logger.log(format!("Error updating price from transaction: {}", e).yellow().to_string());
+    }
+    
     // Update token metrics using the TradeInfoFromToken directly
     if let Err(e) = selling_engine.update_metrics(&mint, &parsed_data).await {
         logger.log(format!("Error updating metrics: {}", e).red().to_string());
@@ -3013,7 +2967,7 @@ async fn handle_parsed_data_for_selling(
     
     // Check if we should sell this token
     match selling_engine.evaluate_sell_conditions(&mint).await {
-        Ok((should_sell, sell_all)) => {
+        Ok((should_sell, sell_all, use_whale_emergency)) => {
             if should_sell {
                 logger.log(format!("Sell conditions met for token: {}", mint).green().to_string());
                 
@@ -3025,24 +2979,92 @@ async fn handle_parsed_data_for_selling(
                 };
                 
                 if sell_all {
-                    // Emergency sell all tokens immediately to prevent further losses
-                    logger.log(format!("EMERGENCY SELL ALL triggered for token: {}", mint).red().bold().to_string());
-                    
-                    match selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await {
-                        Ok(_) => {
-                            logger.log(format!("Successfully executed emergency sell all for token: {}", mint).green().to_string());
-                            // Cancel monitoring task for this token since it's been sold
-                            if let Err(e) = cancel_token_monitoring(&mint, &logger).await {
-                                logger.log(format!("Failed to cancel monitoring for token {}: {}", mint, e).yellow().to_string());
+                    if use_whale_emergency {
+                        // Whale emergency sell using zeroslot for maximum speed
+                        logger.log(format!("🐋 WHALE EMERGENCY SELL triggered for token: {}", mint).cyan().bold().to_string());
+                        
+                        // Get the current PNL to determine whale threshold
+                        if let Some(metrics) = crate::engine::selling_strategy::TOKEN_METRICS.get(&mint) {
+                            let pnl = if metrics.entry_price > 0.0 {
+                                (metrics.current_price - metrics.entry_price) / metrics.entry_price * 100.0
+                            } else {
+                                0.0
+                            };
+                            
+                                                         if let Some(whale_threshold) = selling_engine.get_config().dynamic_whale_selling.get_whale_threshold_for_pnl(pnl) {
+                                match selling_engine.whale_emergency_sell(&mint, &parsed_data, protocol.clone(), whale_threshold).await {
+                                    Ok(_) => {
+                                        logger.log(format!("🐋 Successfully executed whale emergency sell for token: {}", mint).green().bold().to_string());
+                                        // Cancel monitoring task for this token since it's been sold
+                                        if let Err(e) = cancel_token_monitoring(&mint, &logger).await {
+                                            logger.log(format!("Failed to cancel monitoring for token {}: {}", mint, e).yellow().to_string());
+                                        }
+                                    },
+                                    Err(e) => {
+                                        logger.log(format!("🐋 Error executing whale emergency sell: {}", e).red().to_string());
+                                        
+                                        // Fallback to regular emergency sell
+                                        logger.log("Falling back to regular emergency sell".yellow().to_string());
+                                        match selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await {
+                                            Ok(_) => {
+                                                logger.log(format!("Successfully executed fallback emergency sell for token: {}", mint).green().to_string());
+                                                if let Err(e) = cancel_token_monitoring(&mint, &logger).await {
+                                                    logger.log(format!("Failed to cancel monitoring for token {}: {}", mint, e).yellow().to_string());
+                                                }
+                                            },
+                                            Err(e) => {
+                                                logger.log(format!("Error executing fallback emergency sell: {}", e).red().to_string());
+                                                return Err(format!("Failed to execute emergency sell: {}", e));
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                logger.log(format!("🐋 No whale threshold found for PNL {:.2}%, using regular emergency sell", pnl).yellow().to_string());
+                                match selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await {
+                                    Ok(_) => {
+                                        logger.log(format!("Successfully executed emergency sell for token: {}", mint).green().to_string());
+                                        if let Err(e) = cancel_token_monitoring(&mint, &logger).await {
+                                            logger.log(format!("Failed to cancel monitoring for token {}: {}", mint, e).yellow().to_string());
+                                        }
+                                    },
+                                    Err(e) => {
+                                        logger.log(format!("Error executing emergency sell: {}", e).red().to_string());
+                                        return Err(format!("Failed to execute emergency sell: {}", e));
+                                    }
+                                }
                             }
-
-                        },
-                        Err(e) => {
-                            logger.log(format!("Error executing emergency sell all: {}", e).red().to_string());
-                            
-
-                            
-                            return Err(format!("Failed to execute emergency sell all: {}", e));
+                        } else {
+                            logger.log("🐋 No metrics found for whale emergency sell, using regular emergency sell".yellow().to_string());
+                            match selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await {
+                                Ok(_) => {
+                                    logger.log(format!("Successfully executed emergency sell for token: {}", mint).green().to_string());
+                                    if let Err(e) = cancel_token_monitoring(&mint, &logger).await {
+                                        logger.log(format!("Failed to cancel monitoring for token {}: {}", mint, e).yellow().to_string());
+                                    }
+                                },
+                                Err(e) => {
+                                    logger.log(format!("Error executing emergency sell: {}", e).red().to_string());
+                                    return Err(format!("Failed to execute emergency sell: {}", e));
+                                }
+                            }
+                        }
+                    } else {
+                        // Regular emergency sell all tokens immediately to prevent further losses
+                        logger.log(format!("EMERGENCY SELL ALL triggered for token: {}", mint).red().bold().to_string());
+                        
+                        match selling_engine.emergency_sell_all(&mint, &parsed_data, protocol.clone()).await {
+                            Ok(_) => {
+                                logger.log(format!("Successfully executed emergency sell all for token: {}", mint).green().to_string());
+                                // Cancel monitoring task for this token since it's been sold
+                                if let Err(e) = cancel_token_monitoring(&mint, &logger).await {
+                                    logger.log(format!("Failed to cancel monitoring for token {}: {}", mint, e).yellow().to_string());
+                                }
+                            },
+                            Err(e) => {
+                                logger.log(format!("Error executing emergency sell all: {}", e).red().to_string());
+                                return Err(format!("Failed to execute emergency sell all: {}", e));
+                            }
                         }
                     }
                 } else {
@@ -3245,11 +3267,10 @@ async fn monitor_token_for_selling(
         }
     });
 
-    // Create timer for periodic selling checks (every 5 seconds)
-    let mut selling_timer = time::interval(Duration::from_secs(5));
+    // Timer removed - selling checks are now transaction-driven only
     
     // Main stream processing loop
-    logger.log("Starting main processing loop with timer-based selling checks...".green().to_string());
+    logger.log("Starting main processing loop with transaction-driven selling checks...".green().to_string());
     loop {
         tokio::select! {
             // Check for cancellation
@@ -3257,28 +3278,7 @@ async fn monitor_token_for_selling(
                 logger.log(format!("Monitoring cancelled for token: {}", token_mint).yellow().to_string());
                 break;
             }
-            // Timer-based selling checks
-            _ = selling_timer.tick() => {
-                // Check if token still exists in tracking
-                if BOUGHT_TOKEN_LIST.contains_key(&token_mint) {
-                    // Update token price first
-                    if let Err(e) = update_token_price(&token_mint, &app_state).await {
-                        logger.log(format!("Failed to update price for {}: {}", token_mint, e).yellow().to_string());
-                    }
-                    
-                    // Execute threshold-based progressive selling (copy_trading.rs system)
-                    if let Err(e) = execute_enhanced_sell(token_mint.clone(), app_state.clone(), swap_config.clone()).await {
-                        logger.log(format!("Timer-based threshold selling check error for {}: {}", token_mint, e).yellow().to_string());
-                    }
-                    
-
-                } else {
-                    // Token no longer tracked, exit monitoring
-                    logger.log(format!("Token {} no longer tracked, ending monitoring", token_mint).green().to_string());
-                    break;
-                }
-            }
-            // Process stream messages
+            // Process stream messages (transaction-driven selling only)
             msg_result = stream.next() => {
                 match msg_result {
                     Some(Ok(msg)) => {
