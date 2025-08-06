@@ -19,6 +19,7 @@ use solana_vntr_sniper::{
     services::{ cache_maintenance, blockhash_processor::BlockhashProcessor},
     core::token,
 };
+use std::sync::Arc;
 use solana_program_pack::Pack;
 use anchor_client::solana_sdk::pubkey::Pubkey;
 use anchor_client::solana_sdk::transaction::Transaction;

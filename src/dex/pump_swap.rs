@@ -28,6 +28,9 @@ use crate::{
     engine::swap::{SwapDirection, SwapInType},
 };
 
+// Import the volume accumulator structures from pump_fun
+use crate::dex::pump_fun::{GlobalVolumeAccumulator, UserVolumeAccumulator};
+
 // PUMP SWAP FIXES:
 // 1. Fixed buy token amount calculation to use same direct formula as pump fun
 // 2. Fixed sell accounts to have reversed user account order (user SOL and token accounts swapped)
@@ -46,6 +49,24 @@ lazy_static::lazy_static! {
     static ref SOL_MINT: Pubkey = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
     static ref BUY_DISCRIMINATOR: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
     static ref SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
+}
+
+// Volume accumulator seed constants
+const GLOBAL_VOLUME_ACCUMULATOR_SEED: &[u8] = b"global_volume_accumulator";
+const USER_VOLUME_ACCUMULATOR_SEED: &[u8] = b"user_volume_accumulator";
+
+/// Get the global volume accumulator PDA for PumpSwap
+fn get_global_volume_accumulator_pda() -> Result<Pubkey> {
+    let seeds = [GLOBAL_VOLUME_ACCUMULATOR_SEED];
+    let (pda, _bump) = Pubkey::find_program_address(&seeds, &PUMP_SWAP_PROGRAM);
+    Ok(pda)
+}
+
+/// Get the user volume accumulator PDA for a specific user for PumpSwap
+fn get_user_volume_accumulator_pda(user: &Pubkey) -> Result<Pubkey> {
+    let seeds = [USER_VOLUME_ACCUMULATOR_SEED, user.as_ref()];
+    let (pda, _bump) = Pubkey::find_program_address(&seeds, &PUMP_SWAP_PROGRAM);
+    Ok(pda)
 }
 
 // Thread-safe cache with LRU eviction policy
@@ -243,6 +264,10 @@ impl PumpSwap {
         let pool_base_account = get_associated_token_address(&pool_id, &mint);
         let pool_quote_account = get_associated_token_address(&pool_id, &SOL_MINT);
         
+        // Get volume accumulator PDAs
+        let global_volume_accumulator = get_global_volume_accumulator_pda()?;
+        let user_volume_accumulator = get_user_volume_accumulator_pda(&owner)?;
+        
         let accounts = create_buy_accounts(
             pool_id,
             owner,
@@ -253,6 +278,8 @@ impl PumpSwap {
             pool_base_account,
             pool_quote_account,
             coin_creator,
+            global_volume_accumulator,
+            user_volume_accumulator,
         )?;
         
         // Return token amount out and max SOL amount in for buy orders
@@ -326,6 +353,10 @@ impl PumpSwap {
         let pool_base_account = get_associated_token_address(&pool_id, &mint);
         let pool_quote_account = get_associated_token_address(&pool_id, &SOL_MINT);
 
+        // Get volume accumulator PDAs
+        let global_volume_accumulator = get_global_volume_accumulator_pda()?;
+        let user_volume_accumulator = get_user_volume_accumulator_pda(&owner)?;
+
         let accounts = create_sell_accounts(
             pool_id,
             owner,
@@ -336,6 +367,8 @@ impl PumpSwap {
             pool_base_account,
             pool_quote_account,
             coin_creator,
+            global_volume_accumulator,
+            user_volume_accumulator,
         )?;
         
         Ok((amount, min_quote_amount_out, accounts))
@@ -556,6 +589,8 @@ fn create_buy_accounts(
     pool_base_token_account: Pubkey,
     pool_quote_token_account: Pubkey,
     coin_creator: Pubkey,
+    global_volume_accumulator: Pubkey,
+    user_volume_accumulator: Pubkey,
 ) -> Result<Vec<AccountMeta>> {
     let (coin_creator_vault_authority, _) = Pubkey::find_program_address(
         &[b"creator_vault", coin_creator.as_ref()],
@@ -585,6 +620,8 @@ fn create_buy_accounts(
         AccountMeta::new_readonly(*PUMP_SWAP_PROGRAM, false),
         AccountMeta::new(coin_creator_vault_ata, false),
         AccountMeta::new_readonly(coin_creator_vault_authority, false),
+        AccountMeta::new(global_volume_accumulator, false),
+        AccountMeta::new(user_volume_accumulator, false),
         ])
 }
 
@@ -599,6 +636,8 @@ fn create_sell_accounts(
     pool_base_token_account: Pubkey,
     pool_quote_token_account: Pubkey,
     coin_creator: Pubkey,
+    global_volume_accumulator: Pubkey,
+    user_volume_accumulator: Pubkey,
 ) -> Result<Vec<AccountMeta>> {
 
     let (coin_creator_vault_authority, _) = Pubkey::find_program_address(
@@ -629,6 +668,8 @@ fn create_sell_accounts(
         AccountMeta::new_readonly(*PUMP_SWAP_PROGRAM, false),
         AccountMeta::new(coin_creator_vault_ata, false),
         AccountMeta::new_readonly(coin_creator_vault_authority, false),
+        AccountMeta::new(global_volume_accumulator, false),
+        AccountMeta::new(user_volume_accumulator, false),
 ])
 }
 
