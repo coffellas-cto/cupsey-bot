@@ -15,7 +15,7 @@ lazy_static! {
 }
 
 const BLOCKHASH_STALENESS_THRESHOLD: Duration = Duration::from_secs(10);
-const UPDATE_INTERVAL: Duration = Duration::from_millis(100);
+const UPDATE_INTERVAL: Duration = Duration::from_millis(300);
 
 pub struct BlockhashProcessor {
     rpc_client: Arc<RpcClient>,
