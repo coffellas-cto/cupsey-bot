@@ -1819,8 +1819,8 @@ impl SellingEngine {
                         };
                         self.logger.log(format!("🐋 Generated whale PumpFun sell instruction at price: {}", price));
                         
-                        // Execute with zeroslot for maximum speed
-                        match crate::core::tx::new_signed_and_send_zeroslot(
+                        // Execute with zeroslot whale mode for maximum speed
+                        match crate::core::tx::new_signed_and_send_zeroslot_whale_mode(
                             self.app_state.zeroslot_rpc_client.clone(),
                             recent_blockhash,
                             &keypair,
@@ -1870,8 +1870,8 @@ impl SellingEngine {
                         };
                         self.logger.log(format!("🐋 Generated whale PumpSwap sell instruction at price: {}", price));
                         
-                        // Execute with zeroslot for maximum speed
-                        match crate::core::tx::new_signed_and_send_zeroslot(
+                        // Execute with zeroslot whale mode for maximum speed
+                        match crate::core::tx::new_signed_and_send_zeroslot_whale_mode(
                             self.app_state.zeroslot_rpc_client.clone(),
                             recent_blockhash,
                             &keypair,

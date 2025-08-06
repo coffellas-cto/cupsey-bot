@@ -115,6 +115,67 @@ pub async fn new_signed_and_send_zeroslot(
 
     Ok(txs)
 }
+
+
+pub async fn new_signed_and_send_zeroslot_whale_mode(
+    zeroslot_rpc_client: Arc<crate::services::zeroslot::ZeroSlotClient>,
+    recent_blockhash: solana_sdk::hash::Hash,
+    keypair: &Keypair,
+    mut instructions: Vec<Instruction>,
+    logger: &Logger,
+) -> Result<Vec<String>> {
+    let tip_account = zeroslot::get_tip_account()?;
+    let start_time = Instant::now();
+    let mut txs: Vec<String> = vec![];
+    
+    // zeroslot tip, the upper limit is 0.1
+    let tip = zeroslot::get_tip_value().await?;
+    let tip_lamports = ui_amount_to_amount(tip, spl_token::native_mint::DECIMALS);
+
+    let zeroslot_tip_instruction = 
+        system_instruction::transfer(&keypair.pubkey(), &tip_account, tip_lamports);
+        
+        let unit_limit = get_unit_limit() + 100000; // TODO: update in mev boost
+        let unit_price = get_unit_price() + 10000; // TODO: update in mev boost
+        let modify_compute_units =
+        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(unit_limit);
+        let add_priority_fee =
+        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(unit_price);
+        instructions.insert(1, modify_compute_units);
+        instructions.insert(2, add_priority_fee);
+        
+        instructions.push(zeroslot_tip_instruction); // zeroslot is different with others.
+    // send init tx
+    let txn = Transaction::new_signed_with_payer(
+        &instructions,
+        Some(&keypair.pubkey()),
+        &vec![keypair],
+        recent_blockhash,
+    );
+
+    let tx_result = zeroslot_rpc_client.send_transaction(&txn).await;
+    
+    match tx_result {
+        Ok(signature) => {
+            txs.push(signature.to_string());
+            logger.log(
+                format!("[TXN-ELAPSED(ZEROSLOT)]: {:?}", start_time.elapsed())
+                    .yellow()
+                    .to_string(),
+            );
+        }
+        Err(_) => {
+            // Convert the error to a Send-compatible form
+            return Err(anyhow::anyhow!("zeroslot send_transaction failed"));
+        }
+    };
+
+    Ok(txs)
+}
+
+
+
+
 /// Send transaction using normal RPC without any service or tips
 pub async fn new_signed_and_send_normal(
     rpc_client: Arc<anchor_client::solana_client::nonblocking::rpc_client::RpcClient>,
