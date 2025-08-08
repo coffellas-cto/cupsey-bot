@@ -1,7 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
+use std::sync::Arc;
 use anchor_client::solana_sdk::pubkey::Pubkey;
+use anchor_client::solana_sdk::instruction::Instruction;
+use anchor_client::solana_sdk::signature::Keypair;
 use spl_token_2022::state::{Account, Mint};
 use spl_token_2022::extension::StateWithExtensionsOwned;
 use lazy_static::lazy_static;
@@ -207,10 +210,137 @@ impl TargetWalletTokens {
     }
 }
 
+/// Cached transaction for quick selling
+#[derive(Clone)]
+pub struct CachedSellTransaction {
+    pub instructions: Vec<Instruction>,
+    pub keypair: Arc<Keypair>,
+    pub token_mint: String,
+    pub pool_id: String,
+    pub protocol: String, // "PumpFun", "PumpSwap", "RaydiumLaunchpad"
+    pub expected_price: f64,
+    pub slippage_tolerance: u64, // in basis points (e.g., 1000 = 10%)
+    pub created_at: Instant,
+    pub amount_type: String, // "full" or "percentage"
+}
+
+impl CachedSellTransaction {
+    pub fn new(
+        instructions: Vec<Instruction>,
+        keypair: Arc<Keypair>,
+        token_mint: String,
+        pool_id: String,
+        protocol: String,
+        expected_price: f64,
+        slippage_tolerance: u64,
+        amount_type: String,
+    ) -> Self {
+        Self {
+            instructions,
+            keypair,
+            token_mint,
+            pool_id,
+            protocol,
+            expected_price,
+            slippage_tolerance,
+            created_at: Instant::now(),
+            amount_type,
+        }
+    }
+    
+    pub fn is_expired(&self, ttl_seconds: u64) -> bool {
+        self.created_at.elapsed().as_secs() > ttl_seconds
+    }
+    
+    pub fn age_seconds(&self) -> u64 {
+        self.created_at.elapsed().as_secs()
+    }
+}
+
+/// Transaction cache for pre-built selling transactions
+pub struct TransactionCache {
+    transactions: RwLock<HashMap<String, CacheEntry<CachedSellTransaction>>>,
+    default_ttl: u64,
+}
+
+impl TransactionCache {
+    pub fn new(default_ttl: u64) -> Self {
+        Self {
+            transactions: RwLock::new(HashMap::new()),
+            default_ttl,
+        }
+    }
+    
+    /// Get cached transaction by token mint
+    pub fn get(&self, token_mint: &str) -> Option<CachedSellTransaction> {
+        let transactions = self.transactions.read().unwrap();
+        if let Some(entry) = transactions.get(token_mint) {
+            if !entry.is_expired() {
+                return Some(entry.value.clone());
+            }
+        }
+        None
+    }
+    
+    /// Insert transaction into cache
+    pub fn insert(&self, token_mint: String, transaction: CachedSellTransaction, ttl: Option<u64>) {
+        let ttl = ttl.unwrap_or(self.default_ttl);
+        let mut transactions = self.transactions.write().unwrap();
+        transactions.insert(token_mint, CacheEntry::new(transaction, ttl));
+    }
+    
+    /// Remove transaction from cache
+    pub fn remove(&self, token_mint: &str) {
+        let mut transactions = self.transactions.write().unwrap();
+        transactions.remove(token_mint);
+    }
+    
+    /// Clear expired transactions
+    pub fn clear_expired(&self) {
+        let mut transactions = self.transactions.write().unwrap();
+        transactions.retain(|_, entry| !entry.is_expired());
+    }
+    
+    /// Get cache size
+    pub fn size(&self) -> usize {
+        let transactions = self.transactions.read().unwrap();
+        transactions.len()
+    }
+    
+    /// Get all cached token mints
+    pub fn get_cached_tokens(&self) -> Vec<String> {
+        let transactions = self.transactions.read().unwrap();
+        transactions.keys().cloned().collect()
+    }
+    
+    /// Check if token has cached transaction
+    pub fn has_cached_transaction(&self, token_mint: &str) -> bool {
+        let transactions = self.transactions.read().unwrap();
+        if let Some(entry) = transactions.get(token_mint) {
+            !entry.is_expired()
+        } else {
+            false
+        }
+    }
+    
+    /// Update transaction timestamp (refresh TTL)
+    pub fn refresh(&self, token_mint: &str) -> bool {
+        let mut transactions = self.transactions.write().unwrap();
+        if let Some(entry) = transactions.get_mut(token_mint) {
+            if !entry.is_expired() {
+                entry.expires_at = Instant::now() + Duration::from_secs(self.default_ttl);
+                return true;
+            }
+        }
+        false
+    }
+}
+
 // Global cache instances with reasonable TTL values
 lazy_static! {
     pub static ref TOKEN_ACCOUNT_CACHE: TokenAccountCache = TokenAccountCache::new(60); // 60 seconds TTL
     pub static ref TOKEN_MINT_CACHE: TokenMintCache = TokenMintCache::new(300); // 5 minutes TTL
     pub static ref WALLET_TOKEN_ACCOUNTS: WalletTokenAccounts = WalletTokenAccounts::new();
     pub static ref TARGET_WALLET_TOKENS: TargetWalletTokens = TargetWalletTokens::new();
+    pub static ref TRANSACTION_CACHE: TransactionCache = TransactionCache::new(30); // 30 seconds TTL for pre-built transactions
 } 

@@ -913,6 +913,29 @@ pub async fn execute_buy(
         println!("DEBUG TRACKING: Adding token {} to BOUGHT_TOKEN_LIST with entry_price: {}", 
             trade_info.mint, bought_token_info.entry_price);
         
+        // 🚀 CACHE SELL TRANSACTION FOR QUICK SELLING
+        // Pre-build and cache the selling transaction for this token to reduce latency
+        tokio::spawn({
+            let trade_info_clone = trade_info.clone();
+            let protocol_clone = protocol.clone();
+            let app_state_clone = app_state.clone();
+            let token_mint = trade_info.mint.clone();
+            let logger_clone = logger.clone();
+            
+            async move {
+                let cache_manager = crate::engine::transaction_cache::TransactionCacheManager::new(app_state_clone);
+                
+                match cache_manager.cache_sell_transaction(&token_mint, &trade_info_clone, protocol_clone).await {
+                    Ok(_) => {
+                        logger_clone.log(format!("🎯 Successfully cached sell transaction for token: {}", token_mint));
+                    },
+                    Err(e) => {
+                        logger_clone.log(format!("⚠️ Failed to cache sell transaction for {}: {}", token_mint, e));
+                    }
+                }
+            }
+        });
+        
         // Only add to tracking if entry_price is valid
         if bought_token_info.entry_price > 0 {
             BOUGHT_TOKEN_LIST.insert(trade_info.mint.clone(), bought_token_info);
@@ -2918,6 +2941,29 @@ async fn handle_parsed_data_for_selling(
                 };
                 
                 if sell_all {
+                    // 🚀 TRY CACHED TRANSACTION FIRST FOR MAXIMUM SPEED
+                    let cache_manager = crate::engine::transaction_cache::TransactionCacheManager::new(Arc::new(config.app_state.clone()));
+                    
+                    if cache_manager.has_cached_transaction(&mint) {
+                        logger.log(format!("⚡ Using cached transaction for ultra-fast sell: {}", mint).cyan().bold().to_string());
+                        
+                        match cache_manager.execute_cached_sell(&mint, true).await { // Use zeroslot for cached transactions
+                            Ok(signatures) => {
+                                logger.log(format!("🚀 CACHED SELL SUCCESS for token: {} - Signatures: {:?}", mint, signatures).green().bold().to_string());
+                                
+                                // Cancel monitoring task for this token since it's been sold
+                                if let Err(e) = cancel_token_monitoring(&mint, &logger).await {
+                                    logger.log(format!("Failed to cancel monitoring for token {}: {}", mint, e).yellow().to_string());
+                                }
+                                return Ok(());
+                            },
+                            Err(e) => {
+                                logger.log(format!("⚠️ Cached sell failed for {}, falling back to normal sell: {}", mint, e).yellow().to_string());
+                                // Continue to normal selling logic below
+                            }
+                        }
+                    }
+                    
                     if use_whale_emergency {
                         // Whale emergency sell using zeroslot for maximum speed
                         logger.log(format!("🐋 WHALE EMERGENCY SELL triggered for token: {}", mint).cyan().bold().to_string());

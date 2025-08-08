@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::str::FromStr;
 use anyhow::{Result, anyhow};
 use colored::Colorize;
-use anchor_client::solana_client::nonblocking::rpc_client::RpcClient;
+use crate::services::zeroslot;
+
+
 use anchor_client::solana_sdk::{
     instruction::Instruction,
     signature::Keypair,
@@ -10,26 +12,26 @@ use anchor_client::solana_sdk::{
     transaction::Transaction,
 };
 use std::env;
-use anchor_client::solana_sdk::pubkey::Pubkey;
+
 use spl_token::ui_amount_to_amount;
 use solana_sdk::signature::Signer;
-use tokio::time::{Instant, sleep};
-use tokio::sync::Mutex;
+use tokio::time::Instant;
+
 use once_cell::sync::Lazy;
-use reqwest::{Client, ClientBuilder};
-use base64;
-use bs58;
-use std::time::Duration;
+use reqwest::Client;
+
+
+
 use crate::{
     common::{
         logger::Logger,
         config::TransactionLandingMode,
     },
     services::{
-        zeroslot::{self, ZeroSlotClient},
+        zeroslot::ZeroSlotClient,
     },
 };
-use dotenv::dotenv;
+
 
 // prioritization fee = UNIT_PRICE * UNIT_LIMIT
 fn get_unit_price() -> u64 {
@@ -181,7 +183,7 @@ pub async fn new_signed_and_send_normal(
     rpc_client: Arc<anchor_client::solana_client::nonblocking::rpc_client::RpcClient>,
     recent_blockhash: anchor_client::solana_sdk::hash::Hash,
     keypair: &Keypair,
-    mut instructions: Vec<Instruction>,
+    instructions: Vec<Instruction>,
     logger: &Logger,
 ) -> Result<Vec<String>> {
     let start_time = Instant::now();

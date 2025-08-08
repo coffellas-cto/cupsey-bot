@@ -16,7 +16,7 @@ use solana_vntr_sniper::{
         copy_trading::{start_copy_trading, CopyTradingConfig},
         swap::SwapProtocol,
     },
-    services::{ cache_maintenance, blockhash_processor::BlockhashProcessor},
+    services::{ cache_maintenance, BlockhashProcessor, ConnectionMethod},
     core::token,
 };
 use std::sync::Arc;
@@ -351,20 +351,7 @@ async fn main() {
     let run_msg = RUN_MSG;
     println!("{}", run_msg);
     
-    // Initialize blockhash processor
-    match BlockhashProcessor::new(config.app_state.rpc_client.clone()).await {
-        Ok(processor) => {
-            if let Err(e) = processor.start().await {
-                eprintln!("Failed to start blockhash processor: {}", e);
-                return;
-            }
-            println!("Blockhash processor started successfully");
-        },
-        Err(e) => {
-            eprintln!("Failed to initialize blockhash processor: {}", e);
-            return;
-        }
-    }
+    // Note: Enhanced blockhash processor will be initialized later with real-time capabilities
 
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
@@ -421,12 +408,16 @@ async fn main() {
     // Initialize token account list
     initialize_token_account_list(&config).await;
     
-    // Start cache maintenance service (clean up expired cache entries every 60 seconds)
-    cache_maintenance::start_cache_maintenance(60).await;
-    println!("Cache maintenance service started");
+    // Start cache maintenance service (clean up expired cache entries every 30 seconds)
+    // Faster cleanup for transaction cache which has 30s TTL
+    tokio::spawn(async {
+        let cache_service = cache_maintenance::CacheMaintenanceService::new(30);
+        cache_service.start().await;
+    });
+    println!("🧹 Cache maintenance service started (including transaction cache)");
 
-    // Initialize and start real-time blockhash processor for maximum transaction landing success
-    let blockhash_processor = match BlockhashProcessor::new(config.app_state.rpc_client.clone()).await {
+    // Initialize and start enhanced real-time blockhash processor
+    let mut blockhash_processor = match BlockhashProcessor::new(config.app_state.rpc_client.clone()).await {
         Ok(processor) => processor,
         Err(e) => {
             eprintln!("Failed to create blockhash processor: {}", e);
@@ -434,27 +425,45 @@ async fn main() {
         }
     };
     
-    // Start the regular blockhash processor
-    if let Err(e) = blockhash_processor.start().await {
-        eprintln!("Failed to start blockhash processor: {}", e);
-        return;
-    }
-    println!("✅ Blockhash processor started (100ms updates)");
-    
-    // Also start the REAL-TIME blockhash processor using gRPC if available
-    if let (Ok(grpc_url), Ok(grpc_token)) = (
+    // Configure connection method based on available environment variables
+    let connection_method = if let (Ok(grpc_url), Ok(grpc_token)) = (
         std::env::var("YELLOWSTONE_GRPC_HTTP"),
         std::env::var("YELLOWSTONE_GRPC_TOKEN")
     ) {
-        if let Err(e) = blockhash_processor.start_realtime_with_grpc(grpc_url, grpc_token).await {
-            eprintln!("⚠️  Failed to start real-time blockhash processor: {}", e);
-            println!("Continuing with regular blockhash processor...");
+        // Check if WebSocket URL is also available for hybrid mode
+        if let Ok(ws_url) = std::env::var("SOLANA_WEBSOCKET_URL") {
+            println!("🚀 Configuring HYBRID mode (gRPC + WebSocket) for maximum reliability");
+            Some(ConnectionMethod::Hybrid {
+                grpc_url,
+                grpc_token,
+                ws_url,
+            })
         } else {
-            println!("🚀 REAL-TIME blockhash processor started via gRPC - maximum freshness!");
+            println!("⚡ Configuring gRPC real-time mode");
+            Some(ConnectionMethod::Grpc {
+                url: grpc_url,
+                token: grpc_token,
+            })
         }
+    } else if let Ok(ws_url) = std::env::var("SOLANA_WEBSOCKET_URL") {
+        println!("🌐 Configuring WebSocket real-time mode");
+        Some(ConnectionMethod::WebSocket { url: ws_url })
     } else {
-        println!("⚠️  gRPC credentials not found - using regular blockhash processor only");
+        println!("⚠️  No real-time connection configured, using RPC polling only");
+        None
+    };
+    
+    // Set the connection method if available
+    if let Some(method) = connection_method {
+        blockhash_processor.set_connection_method(method);
     }
+    
+    // Start the enhanced blockhash processor
+    if let Err(e) = blockhash_processor.start().await {
+        eprintln!("Failed to start enhanced blockhash processor: {}", e);
+        return;
+    }
+    println!("✅ Enhanced blockhash processor started with real-time updates!");
 
     // Initialize and log selling strategy parameters
     let selling_config = solana_vntr_sniper::engine::selling_strategy::SellingConfig::set_from_env();
