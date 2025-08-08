@@ -2,6 +2,8 @@ use std::sync::Arc;
 use std::str::FromStr;
 use anyhow::{Result, anyhow};
 use colored::Colorize;
+use crate::services::zeroslot;
+
 
 use anchor_client::solana_sdk::{
     instruction::Instruction,

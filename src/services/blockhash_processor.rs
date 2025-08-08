@@ -383,7 +383,7 @@ impl BlockhashProcessor {
                                 
                                 // Update block height
                                 let mut height = BLOCK_HEIGHT.write().await;
-                                *height = block_height;
+                                *height = block_height.map(|h| h as u64);
                                 drop(height);
                                 
                                 block_count += 1;
