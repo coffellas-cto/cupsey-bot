@@ -132,7 +132,7 @@ impl BlockhashProcessor {
                         Ok(blockhash) => {
                             Self::update_blockhash(blockhash).await;
                             if !IS_REAL_TIME_ACTIVE.load(Ordering::Relaxed) {
-                                logger.log(format!("📡 RPC fallback updated blockhash: {}", blockhash).dim().to_string());
+                                logger.log(format!("📡 RPC fallback updated blockhash: {}", blockhash).dimmed().to_string());
                             }
                         }
                         Err(e) => {
@@ -369,35 +369,35 @@ impl BlockhashProcessor {
             match msg_result {
                 Ok(msg) => {
                     if let Some(UpdateOneof::Block(block_update)) = msg.update_oneof {
-                        if let Some(block) = block_update.block {
-                            // Extract blockhash
-                            let blockhash_str = block.blockhash;
-                            if let Ok(blockhash_bytes) = bs58::decode(&blockhash_str).into_vec() {
-                                if blockhash_bytes.len() == 32 {
-                                    let mut hash_array = [0u8; 32];
-                                    hash_array.copy_from_slice(&blockhash_bytes);
-                                    let new_blockhash = Hash::new(&hash_array);
-                                    
-                                    Self::update_blockhash(new_blockhash).await;
-                                    
-                                    // Update block height
-                                    let mut height = BLOCK_HEIGHT.write().await;
-                                    *height = Some(block.block_height);
-                                    drop(height);
-                                    
-                                    block_count += 1;
-                                    
-                                    // Log with performance metrics
-                                    if block_count % 100 == 0 {
-                                        let avg_time = start_time.elapsed().as_secs_f64() / block_count as f64;
-                                        logger.log(format!(
-                                            "⚡ gRPC: {} blocks processed, avg {:.2}s/block, latest: {} (height: {})", 
-                                            block_count,
-                                            avg_time,
-                                            new_blockhash, 
-                                            block.block_height
-                                        ).cyan().to_string());
-                                    }
+                        // Extract blockhash directly from block_update
+                        let blockhash_str = block_update.blockhash;
+                        let block_height = block_update.block_height;
+                        
+                        if let Ok(blockhash_bytes) = bs58::decode(&blockhash_str).into_vec() {
+                            if blockhash_bytes.len() == 32 {
+                                let mut hash_array = [0u8; 32];
+                                hash_array.copy_from_slice(&blockhash_bytes);
+                                let new_blockhash = Hash::new(&hash_array);
+                                
+                                Self::update_blockhash(new_blockhash).await;
+                                
+                                // Update block height
+                                let mut height = BLOCK_HEIGHT.write().await;
+                                *height = Some(block_height);
+                                drop(height);
+                                
+                                block_count += 1;
+                                
+                                // Log with performance metrics
+                                if block_count % 100 == 0 {
+                                    let avg_time = start_time.elapsed().as_secs_f64() / block_count as f64;
+                                    logger.log(format!(
+                                        "⚡ gRPC: {} blocks processed, avg {:.2}s/block, latest: {} (height: {})", 
+                                        block_count,
+                                        avg_time,
+                                        new_blockhash, 
+                                        block_height
+                                    ).cyan().to_string());
                                 }
                             }
                         }
@@ -528,17 +528,21 @@ impl BlockhashProcessor {
     /// Get ultra-fresh blockhash with the best available method
     pub async fn get_ultra_fresh_blockhash(&self) -> Result<Hash> {
         // Try ultra-fresh cache first (< 500ms)
-        let last_updated = BLOCKHASH_LAST_UPDATED.read().await;
-        if let Some(instant) = *last_updated {
-            if instant.elapsed() < Duration::from_millis(500) {
-                drop(last_updated);
-                if let Some(hash) = Self::get_latest_blockhash().await {
-                    self.logger.log("🚀 Using ultra-fresh cached blockhash (< 500ms old)".green().to_string());
-                    return Ok(hash);
-                }
+        let is_ultra_fresh = {
+            let last_updated = BLOCKHASH_LAST_UPDATED.read().await;
+            if let Some(instant) = *last_updated {
+                instant.elapsed() < Duration::from_millis(500)
+            } else {
+                false
+            }
+        };
+        
+        if is_ultra_fresh {
+            if let Some(hash) = Self::get_latest_blockhash().await {
+                self.logger.log("🚀 Using ultra-fresh cached blockhash (< 500ms old)".green().to_string());
+                return Ok(hash);
             }
         }
-        drop(last_updated);
         
         // Try waiting for real-time update
         if IS_REAL_TIME_ACTIVE.load(Ordering::Relaxed) {
