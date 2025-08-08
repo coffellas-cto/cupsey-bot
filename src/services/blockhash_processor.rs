@@ -381,10 +381,13 @@ impl BlockhashProcessor {
                                 
                                 Self::update_blockhash(new_blockhash).await;
                                 
-                                // Update block height  
-                                let mut height = BLOCK_HEIGHT.write().await;
-                                *height = block_height.map(u64::from);
-                                drop(height);
+                                // Update block height
+                                if let Some(height_val) = block_height {
+                                    let mut height = BLOCK_HEIGHT.write().await;
+                                    // Convert BlockHeight to u64 - assuming it's a newtype wrapper
+                                    *height = Some(height_val as u64);
+                                    drop(height);
+                                }
                                 
                                 block_count += 1;
                                 
