@@ -408,9 +408,13 @@ async fn main() {
     // Initialize token account list
     initialize_token_account_list(&config).await;
     
-    // Start cache maintenance service (clean up expired cache entries every 60 seconds)
-    cache_maintenance::start_cache_maintenance(60).await;
-    println!("Cache maintenance service started");
+    // Start cache maintenance service (clean up expired cache entries every 30 seconds)
+    // Faster cleanup for transaction cache which has 30s TTL
+    tokio::spawn(async {
+        let cache_service = cache_maintenance::CacheMaintenanceService::new(30);
+        cache_service.start().await;
+    });
+    println!("🧹 Cache maintenance service started (including transaction cache)");
 
     // Initialize and start enhanced real-time blockhash processor
     let mut blockhash_processor = match BlockhashProcessor::new(config.app_state.rpc_client.clone()).await {
