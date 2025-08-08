@@ -13,6 +13,7 @@ use yellowstone_grpc_proto::geyser::{
     SubscribeRequestFilterBlocks, SubscribeUpdate,
 };
 use futures_util::stream::StreamExt;
+use futures_util::SinkExt; // Add this import for send method
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
