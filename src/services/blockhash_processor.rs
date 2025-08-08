@@ -22,7 +22,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 lazy_static! {
     static ref LATEST_BLOCKHASH: Arc<RwLock<Option<Hash>>> = Arc::new(RwLock::new(None));
     static ref BLOCKHASH_LAST_UPDATED: Arc<RwLock<Option<Instant>>> = Arc::new(RwLock::new(None));
-    static ref BLOCK_HEIGHT: Arc<RwLock<Option<u64>>> = Arc::new(RwLock::new(None));
     static ref CONNECTION_STATUS: Arc<RwLock<ConnectionStatus>> = Arc::new(RwLock::new(ConnectionStatus::Disconnected));
     static ref BLOCKHASH_UPDATED_NOTIFY: Arc<Notify> = Arc::new(Notify::new());
 }
@@ -239,16 +238,9 @@ impl BlockhashProcessor {
                                                     
                                                     Self::update_blockhash(new_blockhash).await;
                                                     
-                                                    // Update block height if available
-                                                    if let Some(height) = block.get("blockHeight").and_then(|v| v.as_u64()) {
-                                                        let mut block_height = BLOCK_HEIGHT.write().await;
-                                                        *block_height = Some(height);
-                                                    }
-                                                    
                                                     logger.log(format!(
-                                                        "🌐 WebSocket blockhash update: {} (height: {})", 
-                                                        new_blockhash,
-                                                        block.get("blockHeight").and_then(|v| v.as_u64()).unwrap_or(0)
+                                                        "🌐 WebSocket blockhash update: {}", 
+                                                        new_blockhash
                                                     ).cyan().to_string());
                                                 }
                                             }
@@ -371,7 +363,6 @@ impl BlockhashProcessor {
                     if let Some(UpdateOneof::Block(block_update)) = msg.update_oneof {
                         // Extract blockhash directly from block_update
                         let blockhash_str = block_update.blockhash;
-                        let block_height = block_update.block_height;
                         
                         if let Ok(blockhash_bytes) = bs58::decode(&blockhash_str).into_vec() {
                             if blockhash_bytes.len() == 32 {
@@ -381,13 +372,7 @@ impl BlockhashProcessor {
                                 
                                 Self::update_blockhash(new_blockhash).await;
                                 
-                                // Update block height
-                                if let Some(height_val) = block_height {
-                                    let mut height = BLOCK_HEIGHT.write().await;
-                                    // block_height is already a u64, no casting needed
-                                    *height = Some(height_val);
-                                    drop(height);
-                                }
+                                // Block height tracking removed as it's not essential
                                 
                                 block_count += 1;
                                 
@@ -395,11 +380,10 @@ impl BlockhashProcessor {
                                 if block_count % 100 == 0 {
                                     let avg_time = start_time.elapsed().as_secs_f64() / block_count as f64;
                                     logger.log(format!(
-                                        "⚡ gRPC: {} blocks processed, avg {:.2}s/block, latest: {} (height: {:?})", 
+                                        "⚡ gRPC: {} blocks processed, avg {:.2}s/block, latest: {}", 
                                         block_count,
                                         avg_time,
-                                        new_blockhash, 
-                                        block_height
+                                        new_blockhash
                                     ).cyan().to_string());
                                 }
                             }
@@ -559,11 +543,7 @@ impl BlockhashProcessor {
         self.get_immediate_blockhash().await
     }
 
-    /// Get current block height
-    pub async fn get_current_block_height() -> Option<u64> {
-        let height = BLOCK_HEIGHT.read().await;
-        *height
-    }
+
 
     /// Get performance statistics
     pub async fn get_stats() -> BlockhashStats {
@@ -571,11 +551,10 @@ impl BlockhashProcessor {
         let is_real_time = IS_REAL_TIME_ACTIVE.load(Ordering::Relaxed);
         let reconnect_attempts = RECONNECT_ATTEMPTS.load(Ordering::Relaxed);
         
-        let (latest_hash, last_updated, block_height) = {
+        let (latest_hash, last_updated) = {
             let hash = LATEST_BLOCKHASH.read().await;
             let updated = BLOCKHASH_LAST_UPDATED.read().await;
-            let height = BLOCK_HEIGHT.read().await;
-            (*hash, *updated, *height)
+            (*hash, *updated)
         };
         
         BlockhashStats {
@@ -583,7 +562,6 @@ impl BlockhashProcessor {
             is_real_time_active: is_real_time,
             latest_blockhash: latest_hash,
             last_updated,
-            current_block_height: block_height,
             total_reconnect_attempts: reconnect_attempts,
         }
     }
@@ -595,6 +573,5 @@ pub struct BlockhashStats {
     pub is_real_time_active: bool,
     pub latest_blockhash: Option<Hash>,
     pub last_updated: Option<Instant>,
-    pub current_block_height: Option<u64>,
     pub total_reconnect_attempts: u64,
 } 
