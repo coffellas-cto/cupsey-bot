@@ -381,9 +381,9 @@ impl BlockhashProcessor {
                                 
                                 Self::update_blockhash(new_blockhash).await;
                                 
-                                // Update block height
+                                // Update block height  
                                 let mut height = BLOCK_HEIGHT.write().await;
-                                *height = block_height.map(|h| h as u64);
+                                *height = block_height.map(u64::from);
                                 drop(height);
                                 
                                 block_count += 1;
