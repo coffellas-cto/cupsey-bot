@@ -384,8 +384,8 @@ impl BlockhashProcessor {
                                 // Update block height
                                 if let Some(height_val) = block_height {
                                     let mut height = BLOCK_HEIGHT.write().await;
-                                    // Convert BlockHeight to u64 - assuming it's a newtype wrapper
-                                    *height = Some(height_val as u64);
+                                    // block_height is already a u64, no casting needed
+                                    *height = Some(height_val);
                                     drop(height);
                                 }
                                 
