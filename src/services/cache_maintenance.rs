@@ -17,7 +17,7 @@ pub struct CacheMaintenanceService {
 impl CacheMaintenanceService {
     pub fn new(cleanup_interval_secs: u64) -> Self {
         Self {
-            logger: Logger::new("CacheMaintenance"),
+            logger: Logger::new("CacheMaintenance".to_string()),
             cleanup_interval: Duration::from_secs(cleanup_interval_secs),
         }
     }

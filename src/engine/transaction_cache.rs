@@ -1,13 +1,12 @@
 use std::sync::Arc;
 use anyhow::{anyhow, Result};
-use anchor_client::solana_sdk::{instruction::Instruction, signature::Keypair};
+use anchor_client::solana_sdk::instruction::Instruction;
 
 use crate::common::cache::{CachedSellTransaction, TRANSACTION_CACHE};
 use crate::common::logger::Logger;
-use crate::common::constants::SwapDirection;
-use crate::core::config::{SwapConfig, SwapInType};
-use crate::engine::transaction_parser::{TradeInfoFromToken, SwapProtocol};
-use crate::engine::copy_trading::AppState;
+use crate::common::config::{AppState, SwapConfig, SwapInType};
+use crate::engine::swap::{SwapDirection, SwapProtocol};
+use crate::engine::transaction_parser::TradeInfoFromToken;
 
 /// Transaction cache manager for pre-building selling transactions
 pub struct TransactionCacheManager {
@@ -19,7 +18,7 @@ impl TransactionCacheManager {
     pub fn new(app_state: Arc<AppState>) -> Self {
         Self {
             app_state,
-            logger: Logger::new("TxCache"),
+            logger: Logger::new("TxCache".to_string()),
         }
     }
     
@@ -211,7 +210,7 @@ impl TransactionCacheManager {
         &self,
         trade_info: &TradeInfoFromToken,
         sell_config: SwapConfig,
-    ) -> Result<(Keypair, Vec<Instruction>, f64)> {
+    ) -> Result<(Arc<anchor_client::solana_sdk::signature::Keypair>, Vec<Instruction>, f64)> {
         let pump = crate::dex::pump_fun::Pump::new(
             self.app_state.rpc_nonblocking_client.clone(),
             self.app_state.rpc_client.clone(),
@@ -225,7 +224,7 @@ impl TransactionCacheManager {
         &self,
         trade_info: &TradeInfoFromToken,
         sell_config: SwapConfig,
-    ) -> Result<(Keypair, Vec<Instruction>, f64)> {
+    ) -> Result<(Arc<anchor_client::solana_sdk::signature::Keypair>, Vec<Instruction>, f64)> {
         let pump_swap = crate::dex::pump_swap::PumpSwap::new(
             self.app_state.wallet.clone(),
             Some(self.app_state.rpc_client.clone()),
@@ -239,7 +238,7 @@ impl TransactionCacheManager {
         &self,
         trade_info: &TradeInfoFromToken,
         sell_config: SwapConfig,
-    ) -> Result<(Keypair, Vec<Instruction>, f64)> {
+    ) -> Result<(Arc<anchor_client::solana_sdk::signature::Keypair>, Vec<Instruction>, f64)> {
         let raydium = crate::dex::raydium_launchpad::Raydium::new(
             self.app_state.wallet.clone(),
             Some(self.app_state.rpc_client.clone()),

@@ -923,7 +923,7 @@ pub async fn execute_buy(
             let logger_clone = logger.clone();
             
             async move {
-                let cache_manager = crate::engine::transaction_cache::TransactionCacheManager::new(app_state_clone);
+                let cache_manager = crate::engine::transaction_cache::TransactionCacheManager::new(Arc::new(app_state_clone));
                 
                 match cache_manager.cache_sell_transaction(&token_mint, &trade_info_clone, protocol_clone).await {
                     Ok(_) => {
@@ -2942,7 +2942,7 @@ async fn handle_parsed_data_for_selling(
                 
                 if sell_all {
                     // 🚀 TRY CACHED TRANSACTION FIRST FOR MAXIMUM SPEED
-                    let cache_manager = crate::engine::transaction_cache::TransactionCacheManager::new(app_state.clone());
+                    let cache_manager = crate::engine::transaction_cache::TransactionCacheManager::new(Arc::new(config.app_state.clone()));
                     
                     if cache_manager.has_cached_transaction(&mint) {
                         logger.log(format!("⚡ Using cached transaction for ultra-fast sell: {}", mint).cyan().bold().to_string());

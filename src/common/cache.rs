@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
+use std::sync::Arc;
 use anchor_client::solana_sdk::pubkey::Pubkey;
 use anchor_client::solana_sdk::instruction::Instruction;
 use anchor_client::solana_sdk::signature::Keypair;
@@ -213,7 +214,7 @@ impl TargetWalletTokens {
 #[derive(Clone)]
 pub struct CachedSellTransaction {
     pub instructions: Vec<Instruction>,
-    pub keypair: Keypair,
+    pub keypair: Arc<Keypair>,
     pub token_mint: String,
     pub pool_id: String,
     pub protocol: String, // "PumpFun", "PumpSwap", "RaydiumLaunchpad"
@@ -226,7 +227,7 @@ pub struct CachedSellTransaction {
 impl CachedSellTransaction {
     pub fn new(
         instructions: Vec<Instruction>,
-        keypair: Keypair,
+        keypair: Arc<Keypair>,
         token_mint: String,
         pool_id: String,
         protocol: String,

@@ -383,7 +383,7 @@ impl BlockhashProcessor {
                                 
                                 // Update block height
                                 let mut height = BLOCK_HEIGHT.write().await;
-                                *height = Some(block_height);
+                                *height = block_height.map(|h| h as u64);
                                 drop(height);
                                 
                                 block_count += 1;
@@ -392,7 +392,7 @@ impl BlockhashProcessor {
                                 if block_count % 100 == 0 {
                                     let avg_time = start_time.elapsed().as_secs_f64() / block_count as f64;
                                     logger.log(format!(
-                                        "⚡ gRPC: {} blocks processed, avg {:.2}s/block, latest: {} (height: {})", 
+                                        "⚡ gRPC: {} blocks processed, avg {:.2}s/block, latest: {} (height: {:?})", 
                                         block_count,
                                         avg_time,
                                         new_blockhash, 
