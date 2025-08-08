@@ -923,7 +923,7 @@ pub async fn execute_buy(
             let logger_clone = logger.clone();
             
             async move {
-                let cache_manager = crate::engine::transaction_cache::TransactionCacheManager::new(Arc::new(app_state_clone));
+                let cache_manager = crate::engine::transaction_cache::TransactionCacheManager::new(app_state_clone);
                 
                 match cache_manager.cache_sell_transaction(&token_mint, &trade_info_clone, protocol_clone).await {
                     Ok(_) => {

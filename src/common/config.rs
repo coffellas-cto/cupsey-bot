@@ -6,7 +6,7 @@ use reqwest::Error;
 use serde::Deserialize;
 use anchor_client::solana_sdk::{commitment_config::CommitmentConfig, signature::Keypair, signer::Signer};
 use tokio::sync::{Mutex, OnceCell};
-use tokio_tungstenite::tungstenite::http::request;
+
 use std::{env, sync::Arc};
 use crate::engine::swap::SwapProtocol;
 use crate::{
@@ -241,6 +241,17 @@ pub struct SwapConfig {
     pub in_type: SwapInType,
     pub amount_in: f64,
     pub slippage: u64,
+}
+
+impl Default for SwapConfig {
+    fn default() -> Self {
+        SwapConfig {
+            swap_direction: SwapDirection::Buy,
+            in_type: SwapInType::Qty,
+            amount_in: 0.001,
+            slippage: 5000,
+        }
+    }
 }
 
 pub fn import_env_var(key: &str) -> String {

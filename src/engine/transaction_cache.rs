@@ -4,7 +4,8 @@ use anchor_client::solana_sdk::instruction::Instruction;
 
 use crate::common::cache::{CachedSellTransaction, TRANSACTION_CACHE};
 use crate::common::logger::Logger;
-use crate::common::config::{AppState, SwapConfig, SwapInType};
+use crate::common::config::{AppState, SwapConfig};
+use crate::engine::swap::SwapInType;
 use crate::engine::swap::{SwapDirection, SwapProtocol};
 use crate::engine::transaction_parser::TradeInfoFromToken;
 
